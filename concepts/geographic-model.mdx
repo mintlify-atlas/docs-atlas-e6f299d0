@@ -1,0 +1,119 @@
+---
+title: "Three-tier concurrency model: Terrain, Pack, and Limit"
+description: "Learn how Lemmings uses a geographic metaphor to express concurrency — Terrain as regions, Pack as population density, and Limit as a safety ceiling."
+---
+
+Lemmings organises concurrency using a three-tier geographic model that maps directly onto how engineers think about real-world traffic events. This page explains how the `Terrain`, `Pack`, and `Limit` parameters interact, how the semaphore ceiling protects your machine under extreme load, and what happens inside each lemming's lifecycle from birth to death.
+
+## The geographic metaphor
+
+The three tiers map onto a mental model borrowed from geography. You can describe a traffic scenario in plain English, then translate it directly into flags:
+
+> "I expect traffic from 50 regions, with 100 concurrent users per region, sustained for 30 seconds per session."
+
+```bash
+lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s -ramp 5m
+```
+
+| Tier | Flag | What it represents |
+|---|---|---|
+| **Terrain** | `-terrain` | Top-level goroutine group — a region or state. Each terrain is an independent cohort of lemmings. |
+| **Pack** | `-pack` | Lemmings per terrain — the population density of each region. |
+| **Limit** | `-limit` | Semaphore ceiling — the system protection valve that prevents all goroutines from spawning simultaneously. |
+
+The total number of lemmings a run will create follows a simple formula:
+
+```
+total lemmings = terrain × pack
+```
+
+A run with `-terrain 50 -pack 100` creates exactly 5,000 lemmings. Each makes multiple page visits during its `-until` lifespan, so total HTTP requests are significantly higher than the lemming count.
+
+## How the semaphore works
+
+The `-limit` flag controls a semaphore (`sema.Semaphore` from the `sema` package) shared across all terrains. Before any lemming runs, it must acquire a slot from this semaphore. When the lemming dies, the slot is released.
+
+This prevents `terrain × pack` goroutines from all spawning simultaneously on a machine that cannot support them. Even if you configure 5,000 lemmings, only `-limit` of them are ever executing concurrently.
+
+```go
+// From terrain.go — spawnLemming acquires the semaphore before running
+if err := t.sem.Acquire(ctx); err != nil {
+    t.metrics.LemmingsFailed.Add(1)
+    return
+}
+defer t.sem.Release()
+```
+
+<Warning>
+Setting `-limit=-1` disables the semaphore ceiling entirely. When limit is -1, the effective limit becomes `terrain × pack` — all lemmings may run simultaneously. On large configurations this can exhaust file descriptors, memory, or OS-level goroutine limits. Use `-limit=-1` only when you have explicitly verified your machine can support the full concurrency.
+</Warning>
+
+### Scale warnings
+
+Lemmings prints warnings at boot when your configuration exceeds safe thresholds:
+
+| Threshold | Value | Meaning |
+|---|---|---|
+| `warnTotalLemmings` | 100,000 | Total `terrain × pack` exceeds recommended maximum |
+| `warnTotalGoroutines` | 10,000 | Effective concurrent goroutines (governed by `-limit`) may stress the scheduler |
+
+If you see these warnings, reduce `-terrain`, `-pack`, or `-limit` before running against a production-adjacent environment.
+
+## The lemming lifecycle
+
+Every lemming follows the same sequence from birth to death. The `Terrain` struct's `spawnLemming` method (in `terrain.go`) orchestrates this lifecycle for every lemming in the pack.
+
+<Steps>
+  <Step title="Acquire semaphore slot">
+    The lemming calls `sem.Acquire(ctx)` on the shared semaphore. It blocks here until a slot is available or the context is cancelled. If the context is cancelled (e.g., you press Ctrl-C), the lemming records a failure in `SwarmMetrics.LemmingsFailed` and exits cleanly.
+  </Step>
+  <Step title="Create an isolated cookie jar">
+    Once the semaphore is acquired, the terrain creates a `cookiejar.New` instance with `publicsuffix.List` for domain scoping. This cookie jar belongs exclusively to this lemming — session cookies set during its lifespan never leak into any other virtual user's session.
+
+    ```go
+    jar, err := cookiejar.New(&cookiejar.Options{
+        PublicSuffixList: publicsuffix.List,
+    })
+    ```
+  </Step>
+  <Step title="Create a dedicated HTTP client">
+    An `http.Client` is constructed with the cookie jar attached and a timeout set to `-until`. The client follows redirects up to a maximum of 10 hops before stopping.
+  </Step>
+  <Step title="Navigate the URLPool until context expires">
+    The `Lemming.Run` method derives a `context.WithTimeout` from `-until` and enters the navigation loop. On each iteration it calls `pickURL()` to select a random URL from the shared `URLPool`, makes an HTTP GET request, records the response, and loops again. The loop runs until the deadline fires.
+  </Step>
+  <Step title="Send LifeLog to swarm on death">
+    When the context deadline expires, `Run` assembles a complete `LifeLog` — containing the lemming's `Identity`, all `Visit` records, birth and death timestamps, and any error — and returns it. The terrain calls the swarm's non-blocking `sendLifeLog` callback to deliver it.
+  </Step>
+  <Step title="Release semaphore slot">
+    The `defer t.sem.Release()` registered in step 1 fires, freeing the slot for another lemming to acquire.
+  </Step>
+</Steps>
+
+## Key types
+
+<AccordionGroup>
+  <Accordion title="SwarmConfig">
+    The single source of truth flowing from CLI flags into every layer of the system. Contains `Terrain int64`, `Pack int64`, and `Limit int` among other fields. Passed by value to every `Terrain` and `Lemming` so each component has an immutable snapshot of configuration.
+  </Accordion>
+  <Accordion title="Terrain">
+    Represents one goroutine group. Owns `cfg.Pack` lemmings. `Launch(ctx)` spawns all lemmings as goroutines and returns immediately. `Wait()` blocks until all lemmings in the terrain have died.
+  </Accordion>
+  <Accordion title="SwarmMetrics">
+    Holds all live atomic counters. `LemmingsAlive`, `LemmingsCompleted`, and `LemmingsFailed` track the lemming population. All fields are `atomic.Int64` — reads and writes are safe from any goroutine without locks.
+  </Accordion>
+  <Accordion title="LifeLog">
+    The complete record of a lemming's life. Contains the lemming's `Identity` (ID, Terrain, Pack, BornAt), a slice of `Visit` records, `BornAt`/`DiedAt`/`Duration` timestamps, and an `Error` field that is non-nil if the lemming died abnormally.
+  </Accordion>
+</AccordionGroup>
+
+## Related concepts
+
+<CardGroup cols={2}>
+  <Card title="Ramp-up behavior" icon="chart-line" href="/concepts/ramp">
+    Learn how Lemmings brings terrain groups online linearly to model real traffic curves.
+  </Card>
+  <Card title="Result collection" icon="database" href="/concepts/result-collection">
+    Understand how LifeLogs are collected, aggregated, and turned into percentile reports.
+  </Card>
+</CardGroup>

@@ -1,0 +1,92 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Lemmings",
+  "projectDescription": "A stateful, session-aware Go load simulator that models real user navigation behavior to stress-test web applications before high-traffic events.",
+  "theme": "aspen",
+  "primaryColor": "#949494",
+  "lightColor": "#3c3c3c",
+  "darkColor": "#cccccc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Command Reference",
+            "pages": [
+              "flags/core",
+              "flags/report-delivery",
+              "flags/dashboard",
+              "flags/prometheus"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/geographic-model",
+              "concepts/url-discovery",
+              "concepts/ramp",
+              "concepts/result-collection"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/waiting-room",
+              "integrations/prometheus",
+              "integrations/report-delivery",
+              "integrations/ci"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/output",
+              "reference/use-cases",
+              "reference/contributing"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Stateful session-aware load simulation with isolated per-lemming cookie jars",
+    "Three-tier geographic concurrency model: Terrain, Pack, and Limit",
+    "Automatic URL discovery via sitemap.xml, robots.txt, or depth-bounded crawl",
+    "Linear ramp-up to model real traffic curves over configurable duration",
+    "First-class waiting room integration with the andreimerlescu/room package",
+    "Live browser dashboard with one-time cryptographic token authentication",
+    "Prometheus metrics endpoint with 11 metrics under the lemmings_ namespace",
+    "Multi-target report delivery: local filesystem, AWS S3, and email (SMTP)",
+    "SHA-512 body checksum comparison to detect degraded content under load",
+    "Race-detector-verified atomic counters for exact metric accuracy"
+  ],
+  "publicApiSurface": [
+    "lemmings -hit <url>",
+    "-terrain / -t",
+    "-pack / -p",
+    "-limit / -l",
+    "-until / -u",
+    "-ramp / -r",
+    "-crawl / -c",
+    "-crawl-depth / -cd",
+    "-save-to / -s",
+    "-dashboard-port / -dp",
+    "-observe / -obs",
+    "-metrics-port / -mp",
+    "-metrics-url-label / -mul",
+    "-tty",
+    "-smtp-host, -smtp-port, -smtp-user, -smtp-pass, -smtp-from",
+    "LEMMINGS_SMTP_HOST, LEMMINGS_SMTP_PORT, LEMMINGS_SMTP_USER, LEMMINGS_SMTP_PASS, LEMMINGS_SMTP_FROM",
+    "LEMMINGS_SAVE_TO"
+  ]
+}

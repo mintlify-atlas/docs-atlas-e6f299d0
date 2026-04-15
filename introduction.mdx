@@ -1,0 +1,82 @@
+---
+title: "Lemmings: Stateful Load Simulator for Real User Traffic"
+description: "Lemmings simulates real browser sessions with isolated cookie jars, not request blasters. Learn what it is, when to use it, and how it differs from wrk and k6."
+---
+
+Lemmings is a stateful, session-aware load simulator written in Go. Unlike tools that fire HTTP requests in a tight loop, Lemmings gives each virtual user — called a lemming — its own cookie jar, its own navigation behavior, and its own lifespan. This page covers what Lemmings is, how it differs from conventional load-testing tools, and the scenarios where it gives you signal that other tools cannot.
+
+## What Lemmings is
+
+Lemmings is a **stateful, session-aware, navigating load simulator**. Before a single lemming moves, Lemmings indexes your application's URL surface by reading its sitemap, checking `robots.txt`, optionally crawling from the origin, and computing a SHA-512 checksum for every page body it finds. Those checksums become the baseline: a lemming that receives a different body than was recorded at index time records `Match: false`. A sustained increase in mismatch rate during a run is a signal that your application is serving error pages or degraded content under pressure.
+
+Each lemming then lives for exactly the duration you specify with `-until`. During that time it picks random URLs from the shared pool, makes GET requests with a randomized but realistic browser User-Agent, reads and checksums the response, records status codes and bytes transferred, and repeats until its context deadline expires. When it dies, it sends its complete `LifeLog` to the swarm's result collector.
+
+## How Lemmings differs from other load tools
+
+Tools like [wrk](https://github.com/wg/wrk), [vegeta](https://github.com/tsenart/vegeta), and [k6](https://k6.io) fire HTTP requests at a fixed rate against a configured target. They are excellent for measuring raw throughput and latency on a single endpoint.
+
+Lemmings does something different. The key differences:
+
+| | wrk / vegeta / k6 | Lemmings |
+|---|---|---|
+| Session model | Shared or stateless client | Isolated cookie jar per lemming |
+| URL targeting | Fixed endpoint or scripted list | Indexed pool, random navigation |
+| Behavior | Request blaster | Navigating user with dwell time |
+| Checksum tracking | No | SHA-512 per page, compared on every visit |
+| Waiting room support | No | First-class, automatic detection |
+| Result collection | Aggregated metrics | Per-lemming `LifeLog` with full visit history |
+
+The practical consequence: Lemmings reveals what happens when real users with real sessions use your application under load — including waiting room queuing, session-dependent behavior, and per-path content degradation.
+
+## The geographic metaphor
+
+Lemmings organizes concurrency using a three-tier model that maps directly to how engineers think about real-world traffic events.
+
+**Terrain** is the top-level goroutine group, like a region or state. You control the number of active terrain groups with `-terrain`. Each terrain group is represented by the `Terrain` struct in the source.
+
+**Pack** is the number of lemmings per terrain group, like the population density of each region. You control pack size with `-pack`.
+
+**Limit** is the semaphore ceiling — a protection valve that prevents `terrain × pack` goroutines from all spawning simultaneously on a machine that cannot support them. You control it with `-limit`.
+
+The total number of lemmings is simply `terrain × pack`. For a product launch where you expect traffic from 50 regions with 100 concurrent users per region:
+
+```bash
+lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s -ramp 5m
+```
+
+The total load — 5,000 lemmings, each making multiple page visits during their 30-second lifespan — is predictable, auditable, and reproducible.
+
+<Note>
+  Lemmings is designed for pre-production load testing. Run it against a local environment or dedicated staging instance — not against production systems you do not control.
+</Note>
+
+## When to use Lemmings
+
+**Before a major traffic event.** A product launch, a sale, a TV spot, a viral post. Run Lemmings with parameters that match your expected traffic shape. If it completes with `dropped_logs: 0`, 2xx rates above your threshold, and p99 latency below your SLA, you are ready.
+
+**For waiting room capacity planning.** If you use the [room](https://github.com/andreimerlescu/room) package, Lemmings tells you exactly how many users will see the waiting room at a given traffic volume, how long they will wait, and how many will give up before admission. Tune room parameters and re-run until the numbers are acceptable.
+
+**For infrastructure sizing.** Increase `-terrain` and `-pack` until the first 5xx responses appear. That is your capacity ceiling. Add infrastructure and re-run to verify the ceiling moved.
+
+**As a daily CI health check.** Run Lemmings with a small `-terrain` and `-pack` against staging on every deploy. A change in 2xx rate, checksum match rate, or p99 latency is an early signal of regression before customers see it.
+
+**For post-incident analysis.** Reconstruct the traffic parameters from your incident logs and re-run. The per-path breakdown shows which routes degraded first and under what conditions.
+
+## License
+
+Lemmings is open source under the [Apache 2.0 license](https://github.com/andreimerlescu/lemmings/blob/main/LICENSE). Contributions are welcome — see the contributing guide for requirements.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Lemmings and run your first load test in under five minutes.
+  </Card>
+  <Card title="How it works" icon="gear" href="/how-it-works">
+    Architecture deep-dive: Swarm, Terrain, Pack, Lemming, URLPool, and LifeLog.
+  </Card>
+  <Card title="Command reference" icon="terminal" href="/flags/core">
+    Every flag, its default value, alias, and validator.
+  </Card>
+  <Card title="Core concepts" icon="book" href="/concepts/geographic-model">
+    The geographic concurrency model, ramp-up scheduling, and result collection.
+  </Card>
+</CardGroup>

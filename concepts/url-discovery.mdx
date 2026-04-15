@@ -1,0 +1,139 @@
+---
+title: "URL discovery: the three-strategy indexing waterfall"
+description: "Understand how Lemmings builds its URLPool before a single lemming moves — sitemap.xml, robots.txt, optional crawl, and the origin-only fallback."
+---
+
+Before a single lemming moves, Lemmings indexes your application's URL surface and computes a SHA-512 checksum for every page it finds. This page explains how the `BuildURLPool` function in `pool.go` works through a waterfall of four strategies to build the shared `URLPool`, why checksums matter for detecting degraded content under load, and what constraints govern the indexing process.
+
+## Why index first
+
+Lemmings simulates navigating users, not request blasters. For lemmings to navigate your site, they need a pool of real URLs to visit. Indexing also establishes a baseline: the SHA-512 checksum of every page at rest, before any load is applied. A lemming that receives a different body than expected records `Match: false` in its `Visit`. A sustained mismatch rate during a run is a signal that your application is serving error pages or degraded content under pressure.
+
+## The URLPool struct
+
+The `URLPool` is built once at boot and shared read-only across all lemmings and all terrains. Nothing writes to it after construction.
+
+```go
+type URLPool struct {
+    Origin    string
+    URLs      []string
+    Checksums map[string]string // url → SHA512 hex of body at index time
+}
+```
+
+Every URL in `URLs` has a corresponding entry in `Checksums`. When a lemming visits a URL, it computes the SHA-512 of the response body and compares it against `Checksums[url]`. The result is stored as `Visit.Match`.
+
+## The four-strategy waterfall
+
+`BuildURLPool` tries four strategies in order. It moves to the next strategy only if the current one produces no URLs.
+
+<Steps>
+  <Step title="Strategy 1 — sitemap.xml at the standard path">
+    Lemmings fetches `<origin>/sitemap.xml`. If the response is HTTP 200 and contains `<loc>` entries, those URLs become the pool. Nested sitemap index files (documents containing `<sitemapindex>`) are followed one level deep — every nested sitemap is fetched and its `<loc>` entries are merged.
+
+    ```go
+    // pool.go — strategy 1
+    urls, err := indexSitemap(ctx, client, origin+sitemapPath)
+    if err == nil && len(urls) > 0 {
+        return pool.hydrate(ctx, client, origin, urls)
+    }
+    ```
+
+    This is the preferred strategy. If your application serves a sitemap, this is the path Lemmings takes.
+  </Step>
+  <Step title="Strategy 2 — sitemap declared in robots.txt">
+    If no sitemap is found at the standard path, Lemmings fetches `<origin>/robots.txt` and scans it for a `Sitemap:` directive. If a directive is found, the URL it points to is fetched and parsed as a sitemap.
+
+    ```go
+    // pool.go — strategy 2
+    robotsSitemapURL, err := findSitemapInRobots(ctx, client, origin+robotsPath)
+    if err == nil && robotsSitemapURL != "" {
+        urls, err = indexSitemap(ctx, client, robotsSitemapURL)
+        if err == nil && len(urls) > 0 {
+            return pool.hydrate(ctx, client, origin, urls)
+        }
+    }
+    ```
+
+    This handles non-standard sitemap locations declared via the `robots.txt` convention.
+  </Step>
+  <Step title="Strategy 3 — crawl from origin (requires -crawl=true)">
+    If neither sitemap strategy yields results and `-crawl` is enabled, Lemmings performs a depth-bounded crawl from the origin URL. The crawler follows anchor `href` links, resolves relative paths to absolute URLs, enforces origin-scoping, and recurses up to `-crawl-depth` levels.
+
+    The crawl runs for a maximum of 5 minutes regardless of depth or link count. A context with a 5-minute timeout is applied inside `crawlOrigin`.
+
+    ```go
+    // pool.go — strategy 3
+    if crawl {
+        urls, err = crawlOrigin(ctx, client, origin, hit, crawlDepth)
+        if err == nil && len(urls) > 0 {
+            return pool.hydrate(ctx, client, origin, urls)
+        }
+    }
+    ```
+
+    <Note>
+      The crawl is disabled by default (`-crawl=false`). Enable it only for sites that have no sitemap and no `robots.txt` sitemap directive. The 5-minute ceiling prevents indexing from delaying your test start indefinitely.
+    </Note>
+  </Step>
+  <Step title="Fallback — origin URL alone">
+    If all three strategies produce no URLs, Lemmings uses the `-hit` URL itself as the sole entry in the pool. The test still runs — it is just limited to one endpoint. A warning is printed to STDOUT.
+
+    ```go
+    // pool.go — fallback
+    fmt.Println("  using origin URL only — no sitemap or crawl results")
+    return pool.hydrate(ctx, client, origin, []string{hit})
+    ```
+
+    A single-URL pool is valid for smoke testing a health check endpoint, but it does not exercise your full URL surface.
+  </Step>
+</Steps>
+
+## Indexing constraints
+
+Every strategy feeds into `hydrate`, which fetches each URL in the candidate list and computes its baseline checksum. The following constraints apply during this phase:
+
+| Parameter | Value | Purpose |
+|---|---|---|
+| `indexTimeout` | 10 seconds per URL | Prevents slow pages from blocking pool construction indefinitely |
+| `indexConcurrency` | 5 parallel fetches | Conservative — avoids load-testing the target during indexing |
+| Origin scoping | enforced | Off-origin URLs are silently dropped before fetching |
+
+Origin scoping is strict: a URL is included only if it shares the exact host as the `-hit` origin. Subdomains are treated as off-origin and dropped. This prevents lemmings from navigating to external domains found in anchor tags or sitemaps.
+
+```go
+// pool.go — scopeToOrigin enforces host matching
+if !strings.HasPrefix(u, origin) {
+    continue
+}
+```
+
+## SHA-512 baseline checksums
+
+The `hydrate` function fetches each scoped URL and computes `sha512sum(body)` — the hex-encoded SHA-512 hash of the full response body. This value is stored in `URLPool.Checksums[url]` at index time.
+
+During the test, each lemming computes the SHA-512 of the body it receives and compares it against the stored baseline:
+
+```go
+// lemming.go — checksum comparison inside hit()
+checksum := sha512sum(body)
+visit.Checksum = checksum
+visit.Match = checksum == visit.Expected
+```
+
+The `Visit.Match` field in every `LifeLog` records whether the page content matched. A single mismatch is normal — cache misses, A/B testing, or dynamic content will produce them. A sustained mismatch rate rising in proportion to load is a reliable indicator of content degradation or error page serving.
+
+<Info>
+  Checksums are computed from the raw response body as read from the network. Gzip decompression is handled transparently by `http.Client`. The checksum reflects the decompressed content so that compression settings do not produce spurious mismatches.
+</Info>
+
+## Related concepts
+
+<CardGroup cols={2}>
+  <Card title="Three-tier concurrency model" icon="layer-group" href="/concepts/geographic-model">
+    Understand how Terrain, Pack, and Limit govern how lemmings use the URLPool.
+  </Card>
+  <Card title="Result collection" icon="database" href="/concepts/result-collection">
+    See how Visit.Match values flow into the final report through the LifeLog collection system.
+  </Card>
+</CardGroup>

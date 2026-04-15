@@ -1,0 +1,113 @@
+---
+title: "Waiting room integration with the room package"
+description: "Lemmings auto-detects room package waiting rooms with no configuration. Tracks queue positions, wait durations, and reports how many lemmings expired in queue."
+---
+
+Lemmings has first-class support for the [andreimerlescu/room](https://github.com/andreimerlescu/room) waiting room package. When a lemming receives a response that contains the room package's queue page, it detects this automatically — no configuration required — records its queue position, waits patiently for admission on the room's polling interval, and reports the full waiting room experience in the final output.
+
+## How detection works
+
+Detection is passive. Lemmings inspects every response body for the signature string `/queue/status`. If found, the lemming knows it has been placed in a room queue and activates waiting room mode for that visit.
+
+```
+waitingRoomSignature  = "/queue/status"
+waitingRoomPositionMarker = `id="position">`
+waitingRoomPollInterval   = 3 * time.Second
+```
+
+These constants match the HTML emitted by the room package exactly. No configuration is needed on your end — as long as you run the room package unmodified, Lemmings will detect it.
+
+## What a lemming does in the queue
+
+<Steps>
+  <Step title="Detect the waiting room">
+    The lemming makes its normal GET request. If the response body contains `/queue/status`, the lemming switches to waiting room mode.
+  </Step>
+  <Step title="Record entry and queue position">
+    `EnteredAt` is set to the current time. The queue position is extracted from the HTML element with `id="position">` and stored in `Position`.
+  </Step>
+  <Step title="Poll every 3 seconds">
+    A ticker fires on the room package's `3s` poll interval. On each tick the lemming re-requests the same URL with its isolated cookie jar intact.
+  </Step>
+  <Step title="Update position on each poll">
+    If the response still contains the waiting room signature, `Position` is updated to reflect the latest queue number.
+  </Step>
+  <Step title="Exit the queue">
+    The lemming exits the waiting room when one of two things happens:
+    - **Admitted** — the response body checksum matches the indexed value for that URL. This means the waiting room has passed the lemming through to the real page.
+    - **Context deadline** — the lemming's `-until` duration expires while still in the queue. The lemming dies in the queue.
+  </Step>
+  <Step title="Record exit metrics">
+    `ExitedAt` and `Duration` are set. A `EventWaitingRoom` event is emitted so that Prometheus metrics and the live dashboard reflect the actual time spent waiting, not zero.
+  </Step>
+</Steps>
+
+## The WaitingRoomMetric struct
+
+Each visit that encounters a waiting room populates a `WaitingRoomMetric` on the visit record:
+
+| Field | Type | Description |
+|---|---|---|
+| `Detected` | `bool` | `true` when the waiting room signature was found in the response |
+| `Position` | `int` | Queue position from the most recent poll |
+| `EnteredAt` | `time.Time` | Timestamp when the lemming was first placed in the queue |
+| `ExitedAt` | `time.Time` | Timestamp when the lemming left the queue (admission or death) |
+| `Duration` | `time.Duration` | `ExitedAt − EnteredAt`, the total time spent in the waiting room |
+
+Bytes transferred are accumulated across all polls, so `BytesIn` on the visit reflects the full cost of waiting, not just the initial request.
+
+## What the report shows
+
+After the swarm completes, the report includes a per-path waiting room count alongside every URL in the breakdown. The swarm-level summary surfaces the aggregate:
+
+```
+waiting room:   312 lemmings held
+```
+
+From the report you can determine:
+
+- How many lemmings were placed in the waiting room
+- Queue positions at entry (available in the per-lemming LifeLog)
+- How long lemmings waited before admission
+- How many lemmings died in the queue without reaching your application (their `DiedAt` will be before they would have been admitted)
+
+## Capacity planning workflow
+
+The canonical use of this integration is iterative capacity planning: run Lemmings, read the waiting room numbers, adjust room parameters, repeat until the wait duration is acceptable.
+
+```bash
+# Run 1: baseline — observe how many lemmings hit the waiting room
+lemmings -hit https://myapp.com -terrain 20 -pack 50 -until 30s
+
+# Read waiting room stats from the generated report:
+#   waiting room:   N lemmings held
+#   per-path WaitingRoom counts show which routes queue most
+#
+# Adjust room capacity parameters in your deployment, then:
+
+# Run 2: verify the improvement
+lemmings -hit https://myapp.com -terrain 20 -pack 50 -until 30s
+```
+
+<Tip>
+Use `-save-to` with a date-stamped path so each run produces a distinct report file you can diff across iterations. For example, `-save-to /var/reports/run-1` and `/var/reports/run-2`.
+</Tip>
+
+## Prometheus metrics
+
+When `-observe` is enabled, two metrics track waiting room behaviour in real time:
+
+| Metric | Type | Description |
+|---|---|---|
+| `lemmings_waiting_room_total` | Counter | Number of lemmings that encountered a waiting room |
+| `lemmings_waiting_room_duration_seconds` | Histogram | Distribution of time spent in the queue before admission or expiry |
+
+These are updated as each lemming exits the queue — not at death — so you see waiting room pressure build during a ramp even while lemmings are still alive.
+
+<Note>
+`lemmings_waiting_room_total` counts waiting room encounters, not individual polls. A lemming that polls 10 times before admission contributes 1 to this counter.
+</Note>
+
+## No configuration required
+
+Lemmings does not need to know in advance that your application uses the room package. Detection is fully automatic based on the response body. If your application does not use room, the `WaitingRoomMetric.Detected` field will always be `false` and waiting room counts will be zero throughout the report.

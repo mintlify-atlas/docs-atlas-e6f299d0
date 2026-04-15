@@ -1,0 +1,164 @@
+---
+title: 'When and Why to Use Lemmings for Load Testing Scenarios'
+description: 'Five scenarios where Lemmings gives you actionable data: traffic event prep, waiting room sizing, capacity ceiling search, and CI regression detection.'
+---
+
+Lemmings is a stateful, session-aware load simulator. It is not a request blaster. Each lemming navigates your application as a real user would — with its own cookie jar, its own lifespan, and its own browsing path across your URL surface. This page documents the five scenarios where that distinction produces information that simpler tools cannot.
+
+<AccordionGroup>
+  <Accordion title="Before a major traffic event">
+
+    A product launch, a sale, a TV spot, or a viral social post all create sudden traffic spikes. Lemmings lets you simulate the expected traffic shape before the event — from your own machine, for free — so you know the answer before your customers find out.
+
+    Model the traffic parameters you expect: how many regions will send traffic, how many concurrent users per region, and how long each user session will last. Map those directly to `-terrain`, `-pack`, and `-until`.
+
+    ```bash
+    lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s -ramp 5m \
+        -save-to ".,s3://reports/launch,mailto:team@co.com?subject=Launch+Test"
+    ```
+
+    **Pass criteria for a go/no-go decision:**
+
+    - `dropped_logs` is zero — all result data was collected
+    - 2xx rate is above your defined threshold (for example, >99%)
+    - p99 latency is below your SLA
+    - `5xx` count is zero or within your error budget
+
+    If the run does not meet these criteria, you have time to fix it. If it does, you have evidence to support the decision to proceed.
+
+    <Tip>
+    Use `-ramp` to model the traffic climb, not just the peak. Real traffic events build over minutes before sustaining at maximum. Failures often appear during the ramp, not at the top.
+    </Tip>
+
+  </Accordion>
+
+  <Accordion title="Waiting room capacity planning">
+
+    If your application uses the [andreimerlescu/room](https://github.com/andreimerlescu/room) waiting room package, Lemmings gives you the data to tune its capacity parameters.
+
+    Run Lemmings and read the waiting room numbers. Adjust room capacity. Re-run. Repeat until the wait duration is acceptable.
+
+    ```bash
+    # Run 1: observe baseline queue behavior
+    lemmings -hit https://myapp.com -terrain 30 -pack 50 -until 45s
+
+    # Adjust room capacity parameters in your deployment, then re-run:
+    lemmings -hit https://myapp.com -terrain 30 -pack 50 -until 45s
+    ```
+
+    The report shows:
+
+    - How many lemmings were placed in the waiting room
+    - Their queue positions at entry
+    - How long they waited before admission
+    - How many died in the queue without ever reaching your application
+
+    Detection is automatic — no configuration is required. Lemmings detects the room package's waiting room HTML on every response and activates queue mode transparently.
+
+    <Note>
+    Save each run to a distinct directory so you can compare reports across iterations: `-save-to /var/reports/run-1`, then `/var/reports/run-2`. The report filename includes the date but not a run counter, so multiple runs on the same day would overwrite.
+    </Note>
+
+  </Accordion>
+
+  <Accordion title="Infrastructure sizing">
+
+    To find your application's capacity ceiling, increase `-terrain` and `-pack` incrementally until the first 5xx responses appear. That threshold defines the ceiling. Add infrastructure and re-run to verify the ceiling moved.
+
+    ```bash
+    # Start conservative
+    lemmings -hit https://myapp.com -terrain 10 -pack 20 -until 30s
+
+    # Increase until first 5xx appear
+    lemmings -hit https://myapp.com -terrain 25 -pack 50 -until 30s
+    lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s
+
+    # Add infrastructure, then verify the ceiling moved
+    lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s
+    ```
+
+    The per-path breakdown in the report shows which routes degraded first. A route that accumulates 5xx counts at lower terrain values than others is usually either a resource-intensive endpoint or one that shares a bottleneck with many other routes.
+
+    **Reading the ceiling:**
+
+    | Signal | Meaning |
+    |---|---|
+    | First 5xx responses appear | You have reached or exceeded current capacity |
+    | p99 latency rises sharply | A shared resource (database, cache) is saturating |
+    | Specific paths show 4xx | Rate limiting or connection limits are triggering |
+    | `dropped_logs` becomes non-zero | Lemmings itself is the bottleneck — increase `-limit` |
+
+  </Accordion>
+
+  <Accordion title="Daily CI health check">
+
+    Run Lemmings with a small `-terrain` and `-pack` against staging on every deploy. A change in 2xx rate, checksum match rate, or p99 latency between runs is an early regression signal before customers see it.
+
+    ```bash
+    lemmings -hit https://staging.myapp.com \
+        -terrain 5 -pack 5 -until 10s \
+        -tty=false \
+        -save-to "s3://ci-reports/lemmings"
+    ```
+
+    Use `-tty=false` in CI pipelines so each ticker update appears on its own line, which is compatible with log aggregation and CI output capture.
+
+    **Regression signals to watch between runs:**
+
+    | Metric | Change that indicates regression |
+    |---|---|
+    | 2xx rate | Drop below baseline |
+    | Checksum match rate | Increase in `Match: false` visits |
+    | p99 latency | Statistically significant increase |
+    | 5xx count | Any non-zero value when baseline is zero |
+
+    <Tip>
+    Name your S3 paths to include the commit SHA or deploy timestamp: `-save-to "s3://ci-reports/lemmings/${GIT_SHA}"`. This makes it straightforward to retrieve and compare the report for any specific deploy.
+    </Tip>
+
+  </Accordion>
+
+  <Accordion title="Post-incident analysis">
+
+    After a traffic incident, reconstruct the traffic parameters from your incident logs and re-run Lemmings to reproduce the conditions. The per-path breakdown shows which routes degraded first and under what load.
+
+    ```bash
+    # Example: incident showed approximately 1,200 concurrent users for about 2 minutes
+    lemmings -hit https://myapp.com -terrain 40 -pack 30 -until 120s -ramp 2m
+    ```
+
+    Map your incident observations to Lemmings parameters:
+
+    | Incident observation | Lemmings parameter |
+    |---|---|
+    | Peak concurrent users | `terrain × pack` |
+    | Session duration (average time on site) | `-until` |
+    | Traffic build time (ramp from baseline to peak) | `-ramp` |
+    | Duration of sustained peak | `-until` (if similar to session length) |
+
+    After reproducing the incident load, the report shows which paths accumulated 5xx counts, which paths saw the highest p99 latency degradation, and which paths triggered waiting room placement. This narrows the investigation to specific routes before you start reading application logs.
+
+    <Note>
+    Post-incident runs are most useful when the incident had a clear traffic cause. If the incident was caused by a dependency failure, a configuration change, or a data volume threshold, Lemmings will reproduce the traffic but not the root cause.
+    </Note>
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Choosing parameters
+
+This table maps common scenarios to starting parameters. Adjust from these baselines based on your application and infrastructure.
+
+| Scenario | `-terrain` | `-pack` | `-until` | `-ramp` |
+|---|---|---|---|---|
+| Quick smoke test | 2 | 2 | 10s | 5s |
+| CI health check | 5 | 5 | 10s | 30s |
+| Moderate load test | 20 | 25 | 30s | 2m |
+| Pre-launch simulation | 50 | 100 | 30s | 5m |
+| Capacity ceiling search | Start at 10×10, double until 5xx | — | 30s | 1m |
+
+<Warning>
+When `terrain × pack` exceeds 100,000, Lemmings prints a large-run warning at boot. Runs at this scale require a machine with adequate CPU and file descriptor limits. Start conservative and scale up.
+</Warning>

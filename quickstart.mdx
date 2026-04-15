@@ -1,80 +1,192 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: run your first Lemmings load test"
+description: "Install Lemmings with go install and run your first stateful load test in minutes. Covers installation, basic run, reading live output, and the final report."
 ---
 
-## Get started in three steps
+Lemmings is a single Go binary with no external runtime dependencies. This page walks you through installation, your first load test, and how to read the output Lemmings produces. By the end, you will have run a real simulation and know what the numbers mean.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- Go 1.23 or later installed (`go version` to check)
+- A running web application to test (local or staging)
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+## Install
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Install the binary">
+    Install Lemmings directly from source using `go install`:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    go install github.com/andreimerlescu/lemmings@latest
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    This downloads, compiles, and places the `lemmings` binary in your `$GOPATH/bin` (typically `~/go/bin`).
+  </Step>
+  <Step title="Verify the installation">
+    Check that the binary is available on your `$PATH`:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    which lemmings
+    ```
 
-### Step 3: Go live
+    If `lemmings` is not found, ensure `~/go/bin` is in your `$PATH`:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    export PATH="$PATH:$(go env GOPATH)/bin"
+    ```
+  </Step>
+</Steps>
+
+## Run your first load test
+
+<Steps>
+  <Step title="Start a basic simulation">
+    Run Lemmings against a local server. This command launches 10 terrain groups with 10 lemmings each (100 total) for 30 seconds:
+
+    ```bash
+    lemmings -hit http://localhost:8080/ -terrain 10 -pack 10 -until 30s
+    ```
+
+    Lemmings will:
+    1. Index your application's URLs from its sitemap (or crawl if no sitemap exists)
+    2. Print a boot summary
+    3. Print a one-time dashboard token
+    4. Begin ramping lemmings online
+  </Step>
+  <Step title="Read the boot summary">
+    Before any lemming moves, Lemmings prints a summary of what is about to happen:
+
+    ```text
+    lemmings v1.0.0
+    ─────────────────────────────────────────
+      target:        http://localhost:8080/
+
+      terrain:       10 groups
+      pack:          10 lemmings per terrain
+      total:         100 lemmings
+
+      until:         30s per lemming
+      ramp:          5m0s to full concurrency
+      est. duration: ~5m30s wall clock
+
+      limit:         100 goroutines
+      save-to:
+        → .
+      dashboard:     http://localhost:4000
+    ─────────────────────────────────────────
+      lemmings are gathering...
+    ```
+
+    The `est. duration` is `ramp + until`. With the default 5-minute ramp and 30-second lifespan, the wall clock is approximately 5m30s. Reduce `-ramp` for faster tests.
+  </Step>
+  <Step title="Watch the live ticker">
+    Once lemmings are running, the terminal updates every second:
+
+    ```text
+    [0m45s] terrains: 2 | alive: 20 | done: 0 | visits: 143 | 2xx: 138 4xx: 4 5xx: 1
+    ```
+
+    - **terrains** — terrain groups that have come online so far
+    - **alive** — lemmings currently navigating
+    - **done** — lemmings that have completed their lifespan
+    - **visits** — total page hits since the run started
+    - **2xx / 4xx / 5xx** — response code class totals
+
+    If `overflow` or `dropped` counts appear, your `-limit` is too low for the volume. See the [result collection concept](/concepts/result-collection) page.
+  </Step>
+  <Step title="Open the live dashboard">
+    A one-time authentication token is printed before the boot summary. While the run is active, open `http://localhost:4000` in your browser and paste the token to unlock real-time counters and a live event stream.
+
+    <Tip>
+      The raw token is never stored after printing — only its SHA-512 hash is held in memory. If you miss it, start a new run.
+    </Tip>
+  </Step>
+  <Step title="Read the final summary">
+    When all lemmings have died, Lemmings prints a final summary and writes the report files:
+
+    ```text
+    ─────────────────────────────────────────
+      lemmings v1.0.0 — final summary
+    ─────────────────────────────────────────
+      target:         http://localhost:8080/
+      total lemmings: 100
+      completed:      100
+      failed:         0
+
+      total visits:   1,247
+      total bytes:    45.30 MB
+
+      2xx:            1,231
+      3xx:            8
+      4xx:            6
+      5xx:            2
+
+      waiting room:   0 lemmings held
+    ─────────────────────────────────────────
+      report (md):   ./lemmings/localhost-8080/lemmings.2026.04.15.localhost-8080.md
+      report (html): ./lemmings/localhost-8080/lemmings.2026.04.15.localhost-8080.html
+    ```
+
+    The HTML report includes per-path latency percentiles (p50, p90, p95, p99), response code breakdowns by URL, and waiting room statistics if applicable.
+  </Step>
+</Steps>
+
+## Common run patterns
+
+<Tabs>
+  <Tab title="Quick test (no ramp)">
+    For fast iteration, shrink the ramp to 0 and reduce terrain/pack:
+
+    ```bash
+    lemmings -hit http://localhost:8080/ -terrain 5 -pack 5 -until 15s -ramp 1s
+    ```
+
+    Wall clock: ~16 seconds.
+  </Tab>
+  <Tab title="Pre-launch simulation">
+    Model traffic from 50 regions with 50 users each, ramping over 5 minutes:
+
+    ```bash
+    lemmings -hit https://staging.myapp.com \
+        -terrain 50 -pack 50 -until 30s -ramp 5m
+    ```
+
+    Wall clock: ~5m30s. Total: 2,500 lemmings.
+  </Tab>
+  <Tab title="With crawl (no sitemap)">
+    If your application doesn't have a sitemap, enable crawling:
+
+    ```bash
+    lemmings -hit https://myapp.com -terrain 10 -pack 10 -until 30s -crawl
+    ```
+
+    Lemmings crawls from the origin up to depth 3 and indexes all discovered URLs before starting.
+  </Tab>
+  <Tab title="CI mode">
+    Disable TTY output and save the report to S3 for CI pipelines:
+
+    ```bash
+    lemmings -hit https://staging.myapp.com \
+        -terrain 5 -pack 5 -until 10s \
+        -tty=false \
+        -save-to "s3://ci-reports/lemmings"
+    ```
+  </Tab>
+</Tabs>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="How it works" icon="gear" href="/how-it-works">
+    Understand the Swarm, Terrain, Pack, and LifeLog architecture in depth.
+  </Card>
+  <Card title="Command reference" icon="terminal" href="/flags/core">
+    Every flag, its default value, alias, and validation rules.
+  </Card>
+  <Card title="Report delivery" icon="file-export" href="/integrations/report-delivery">
+    Send reports to the local filesystem, AWS S3, or email.
+  </Card>
+  <Card title="Prometheus metrics" icon="chart-line" href="/integrations/prometheus">
+    Scrape live metrics with -observe during your load test.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

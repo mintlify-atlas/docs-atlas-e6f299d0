@@ -1,0 +1,130 @@
+---
+title: "Dashboard Flag: Live Browser Monitoring During a Run"
+description: "Reference for the Lemmings -dashboard-port flag (default 4000), authentication flow, and the real-time metrics and event stream the dashboard exposes."
+---
+
+Lemmings starts a live browser dashboard automatically every time it runs. This page documents the `-dashboard-port` flag that controls which port the dashboard listens on, the one-time authentication flow you must complete before the dashboard unlocks, and the metrics and event stream the dashboard displays.
+
+---
+
+## Flag
+
+<ParamField path="-dashboard-port" type="int" default="4000">
+  The TCP port on which the Lemmings live dashboard HTTP server listens. The
+  dashboard is available at `http://localhost:<port>` for the full duration of
+  the run.
+
+  **Alias:** `-dp`
+
+  **Validation:** must be between `1024` and `65535` (inclusive).
+
+  **When to change:** if port `4000` is already in use on your machine, or if
+  you are running multiple Lemmings instances simultaneously and need each to
+  expose its dashboard on a distinct port.
+</ParamField>
+
+---
+
+## Authentication
+
+The dashboard is protected by a one-time token. The authentication flow works
+as follows:
+
+<Steps>
+  <Step title="Token generation at startup">
+    When the swarm boots, Lemmings generates a cryptographically random 256-bit
+    token using `crypto/rand`. The raw hex-encoded token is printed once to the
+    terminal in the boot summary:
+
+    ```
+    dashboard token: 3f8a2c1d...e7b4f091
+    ```
+  </Step>
+  <Step title="Token hashing">
+    The SHA-512 hash of the raw token is stored in memory. The raw token is
+    never retained after printing — it exists only in the terminal output.
+  </Step>
+  <Step title="Unlock the dashboard">
+    Open `http://localhost:4000` (or your configured port) in a browser. Enter
+    the token printed in the terminal to unlock the dashboard.
+  </Step>
+  <Step title="Session cookie">
+    On successful token entry, the dashboard sets an `HttpOnly`, `SameSiteStrict`
+    session cookie. Subsequent page loads do not require re-entering the token for
+    the duration of the browser session.
+  </Step>
+</Steps>
+
+<Note>
+  Copy the token from the terminal before navigating away from the startup
+  output. It is printed only once and is not stored in any file. If you lose
+  it, restart the Lemmings run.
+</Note>
+
+---
+
+## What the dashboard shows
+
+The dashboard updates in real time for the full duration of the run. Engineers
+who open the dashboard mid-run see the last 1,000 events replayed immediately
+on load — the view is never empty on a cold join.
+
+### Live counters
+
+| Metric | Description |
+|---|---|
+| Lemmings alive | Goroutines currently running as active lemmings |
+| Lemmings completed | Lemmings that have finished their `-until` lifespan |
+| Terrains online | Terrain groups that have been brought online by the ramp |
+| Total visits | Cumulative page visits across all lemmings |
+| Total bytes transferred | Cumulative response bytes received |
+| 2xx responses | Count of successful HTTP responses |
+| 3xx responses | Count of redirect responses |
+| 4xx responses | Count of client-error responses |
+| 5xx responses | Count of server-error responses |
+| Waiting room hits | Lemmings that encountered a waiting room at least once |
+| Overflow log count | LifeLogs routed to the overflow channel (warning, no data loss) |
+| Dropped log count | LifeLogs dropped when both channels were full (indicates `-limit` is too low) |
+
+<Warning>
+  A non-zero dropped log count means result data was lost during the run. If you
+  see this, increase `-limit` or reduce `-terrain` and `-pack` and re-run to
+  obtain accurate report figures.
+</Warning>
+
+### Live event stream
+
+The dashboard also shows a chronological event stream with three event types:
+
+- **Birth events** — a lemming came online in a terrain group
+- **Death events** — a lemming completed its lifespan and sent its LifeLog
+- **Waiting room events** — a lemming was placed in a waiting room
+
+Events are emitted in real time as they occur. On a cold join, the last 1,000
+events are replayed so the stream is immediately populated when you open the
+dashboard.
+
+---
+
+## Example
+
+```bash
+# Run with a custom dashboard port
+lemmings -hit https://myapp.com -terrain 50 -pack 50 -until 30s -dashboard-port 8088
+```
+
+Then open `http://localhost:8088` in a browser and enter the token printed at
+startup.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Core flags" icon="sliders" href="/flags/core">
+    Control load shape, terrain concurrency, lifespans, and ramp-up timing.
+  </Card>
+  <Card title="Prometheus metrics" icon="chart-line" href="/flags/prometheus">
+    Scrape the same metrics from a Prometheus-compatible endpoint during the run.
+  </Card>
+</CardGroup>

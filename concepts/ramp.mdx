@@ -1,0 +1,130 @@
+---
+title: "Ramp-up: how Lemmings shapes load linearly over time"
+description: "Learn how Lemmings brings terrain groups online gradually using -ramp, why the climb to peak load matters, and how to size a ramp for your scenario."
+---
+
+Lemmings models real-world traffic curves using the `-ramp` flag. Rather than spawning all terrain groups simultaneously, Lemmings brings them online linearly over the ramp duration — one terrain every few seconds, each carrying its full pack of lemmings. This page explains how the ramp is implemented, why the climb to peak load is the most important phase to observe, and how to interpret the boot summary's estimated wall clock time.
+
+## Why ramp matters
+
+Real traffic does not arrive all at once. When a TV commercial airs, interest builds gradually. When a product launches, early adopters arrive first. A spike after a viral post ramps over minutes, not milliseconds. Running your entire simulated load simultaneously misses the most failure-prone part of a real event: the climb.
+
+Failures often appear during the ascent to peak load, not at the peak itself. Systems that hold steady at 5,000 concurrent users sometimes buckle at 2,000 if connections were established simultaneously and your connection pool saturated in the first second. Ramping reveals this.
+
+## The ramp formula
+
+The ramp divides the total time evenly across the number of terrain groups:
+
+```
+interval = ramp ÷ number_of_terrains
+```
+
+With the default values (`-ramp 5m`, `-terrain 50`):
+
+```
+interval = 5 minutes ÷ 50 = 6 seconds between terrains
+```
+
+One new terrain — with its full pack of lemmings — comes online every 6 seconds. After 5 minutes, all terrains are running and the swarm is at peak load.
+
+## Implementation
+
+The `Swarm.ramp()` method in `swarm.go` implements this behavior. It iterates over the pre-constructed `terrains` slice, calls `t.Launch(ctx)` for each terrain, waits the computed interval, then moves to the next.
+
+```go
+// swarm.go — the ramp loop
+func (s *Swarm) ramp() error {
+    n := len(s.terrains)
+    interval := s.cfg.Ramp / time.Duration(n)
+
+    for i, t := range s.terrains {
+        t.Launch(s.ctx)
+        s.metrics.TerrainsOnline.Add(1)
+
+        if i < n-1 {
+            select {
+            case <-s.ctx.Done():
+                return nil
+            case <-time.After(interval):
+            }
+        }
+    }
+    return nil
+}
+```
+
+Context cancellation is checked between every terrain launch. If you press Ctrl-C mid-ramp, the ramp stops cleanly after the current terrain is online. Lemmings already running continue until their `-until` deadline or context cancellation, whichever comes first.
+
+## The boot summary
+
+When Lemmings starts, it prints the estimated wall clock duration before any lemming moves:
+
+```
+  terrain:       50 groups
+  pack:          100 lemmings per terrain
+  total:         5,000 lemmings
+
+  until:         30s per lemming
+  ramp:          5m0s to full concurrency
+  est. duration: ~5m30s wall clock
+```
+
+The estimate is `ramp + until`: 5 minutes to bring all terrains online, plus 30 seconds for the last terrain's lemmings to complete their lifespan. The actual wall clock will be close to this but may vary slightly depending on system load.
+
+## Example: pre-launch stress test
+
+This is the canonical scenario from the README. A product launch is expected to generate traffic equivalent to 50 geographic regions, each with 100 concurrent users, sustaining for 30 seconds per session.
+
+```bash
+lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s -ramp 5m
+# Total: 5,000 lemmings
+# Wall clock: ~5m30s
+# One new terrain every 6s, each bringing 100 lemmings online
+```
+
+What to look for:
+
+- **2xx rate during the climb** — does your success rate hold steady as load increases, or does it degrade at a specific concurrency level?
+- **p99 latency at the inflection point** — does response time spike when the 20th or 30th terrain comes online?
+- **5xx appearance** — at what terrain count do errors first appear? That is your current capacity ceiling.
+
+## Reducing ramp time for fast iterations
+
+During development you may want faster iterations. Reduce both `-terrain` and `-ramp` to get results in under a minute:
+
+```bash
+# Fast iteration: 10 terrains, 30s ramp = 3s between terrains
+lemmings -hit https://staging.myapp.com -terrain 10 -pack 20 -until 20s -ramp 30s
+```
+
+<Tip>
+  Use a small ramp with small terrain and pack values for your first run against a new target. Verify the URL pool indexed correctly and that the 2xx rate is healthy before scaling up to production-level parameters.
+</Tip>
+
+## Ramp with CI
+
+In CI you typically want a short, deterministic run with no ramp at all. Set `-ramp` to a very small value or equal to the interval between terrains:
+
+```bash
+lemmings -hit https://staging.myapp.com \
+    -terrain 5 -pack 5 -until 10s \
+    -ramp 4s \
+    -tty=false \
+    -save-to "s3://ci-reports/lemmings"
+# 5 terrains × 4s ramp = ~0.8s between terrains — near-simultaneous
+```
+
+<Note>
+  `-tty=false` disables the carriage-return live ticker and writes newlines instead. This prevents garbled output in CI log systems like GitHub Actions, CircleCI, and Jenkins.
+</Note>
+
+## Related concepts
+
+<CardGroup cols={2}>
+  <Card title="Three-tier concurrency model" icon="layer-group" href="/concepts/geographic-model">
+    Understand Terrain, Pack, and Limit — the parameters that determine what comes online during the ramp.
+  </Card>
+  <Card title="Result collection" icon="database" href="/concepts/result-collection">
+    See how metrics are collected atomically as terrains come online during the ramp.
+  </Card>
+</CardGroup>

@@ -1,0 +1,203 @@
+---
+title: 'Understanding Lemmings Output and Reading Test Results'
+description: 'A complete guide to the boot summary, live ticker, final summary, and report files that Lemmings produces during and after every load test run.'
+---
+
+Lemmings produces three distinct output streams during a run: a boot summary printed before any lemming moves, a live ticker that updates every second while the swarm is active, and a final summary with links to the generated report files. This page explains every field in each section and describes the content of the saved report files.
+
+## Boot summary
+
+The boot summary is printed once, immediately after `lemmings` parses its configuration. It tells you exactly what is about to happen so you can verify the parameters before the swarm starts.
+
+```
+lemmings v1.0.0
+─────────────────────────────────────────
+  target:        https://myapp.com/
+
+  terrain:       50 groups
+  pack:          50 lemmings per terrain
+  total:         2,500 lemmings
+
+  until:         30s per lemming
+  ramp:          5m0s to full concurrency
+  est. duration: ~5m30s wall clock
+
+  limit:         100 goroutines
+  save-to:
+    → .
+    → s3://my-bucket/lemmings
+    → mailto:ops@mycompany.com
+  dashboard:     http://localhost:4000
+  metrics:       http://localhost:9090/metrics
+─────────────────────────────────────────
+  lemmings are gathering...
+```
+
+### Field reference
+
+| Field | Description |
+|---|---|
+| `target` | The origin URL passed to `-hit`. Every lemming starts from the URL pool indexed from this origin. |
+| `terrain` | Number of terrain goroutine groups (`-terrain`). Think of each terrain as a geographic region sending traffic. |
+| `pack` | Number of lemmings per terrain group (`-pack`). |
+| `total` | `terrain × pack` — the total number of virtual users for this run. |
+| `until` | How long each lemming lives (`-until`). This is per-lemming lifespan, not wall clock time. |
+| `ramp` | How long it takes to bring all terrain groups online (`-ramp`). Terrains are brought online linearly over this period. |
+| `est. duration` | `ramp + until` — the approximate wall clock duration of the full run. |
+| `limit` | The goroutine semaphore ceiling (`-limit`). Prevents all `terrain × pack` goroutines from spawning simultaneously. |
+| `save-to` | All configured report delivery destinations, one per line. Each destination receives both the markdown and HTML report. |
+| `dashboard` | URL of the live dashboard. Accessible during the run once you enter the one-time authentication token. |
+| `metrics` | URL of the Prometheus `/metrics` endpoint. Only shown when `-observe` is enabled. |
+
+### Dashboard token
+
+Between the closing separator line and the `lemmings are gathering...` message, Lemmings prints a one-time authentication token:
+
+```
+  dashboard token: 3f8a2c1d...
+```
+
+Enter this token in the browser when prompted by the dashboard. The token is a cryptographically random 256-bit value. Only its SHA-512 hash is retained in memory after printing — the raw token is never stored.
+
+### Warning messages
+
+Lemmings prints warnings in the boot summary under specific conditions.
+
+<Warning>
+If `terrain × pack` exceeds 100,000, Lemmings prints: `⚠ WARNING: large run — ensure your system and target can handle this load.`
+</Warning>
+
+<Warning>
+If `-terrain` exceeds 10,000, Lemmings prints a goroutine count warning because the terrain layer alone creates that many goroutines before packs spawn.
+</Warning>
+
+<Warning>
+If `-limit=-1`, Lemmings prints: `⚠ WARNING: -limit=-1 disables the semaphore entirely` and shows the total goroutine count that may spawn simultaneously. Use this setting only when you have confirmed the host machine and target can handle it.
+</Warning>
+
+---
+
+## Live ticker
+
+While the swarm runs, Lemmings prints a live status line every second.
+
+```
+[1m23s] terrains: 14 | alive: 700 | done: 12 | visits: 4,821 | 2xx: 4,788 4xx: 22 5xx: 11
+```
+
+In TTY mode (the default), the line is overwritten each second using `\r` (carriage return), so it appears to update in place. In CI mode (`-tty=false`), each update is printed on a new line with `\n`, producing log-friendly output suitable for capture to a file.
+
+### Ticker field reference
+
+| Field | Description |
+|---|---|
+| `[elapsed]` | Wall clock time since the swarm started. |
+| `terrains` | Number of terrain groups currently online. Increases linearly during the ramp phase until it reaches the configured `-terrain` value. |
+| `alive` | Number of lemmings currently running. Increases as terrains come online, then decreases as lemmings reach their `-until` deadline. |
+| `done` | Number of lemmings that have completed and sent their results to the collector. |
+| `visits` | Cumulative page visits across all living and completed lemmings. |
+| `2xx` | Cumulative count of HTTP 2xx responses. |
+| `4xx` | Cumulative count of HTTP 4xx responses. |
+| `5xx` | Cumulative count of HTTP 5xx responses. |
+
+<Note>
+`overflow` and `dropped` counts are only shown when non-zero. If you see `⚠ dropped: N` in the ticker, your `-limit` is too low for the volume. Increase `-limit` or reduce `-terrain` and `-pack` to ensure accurate results.
+</Note>
+
+---
+
+## Final summary
+
+When all lemmings have died and results are collected, Lemmings prints the final summary.
+
+```
+─────────────────────────────────────────
+  lemmings v1.0.0 — final summary
+─────────────────────────────────────────
+  target:         https://myapp.com/
+  total lemmings: 2,500
+  completed:      2,500
+  failed:         0
+
+  total visits:   41,337
+  total bytes:    1.24 GB
+
+  2xx:            40,892
+  3xx:            211
+  4xx:            187
+  5xx:            47
+
+  waiting room:   312 lemmings held
+─────────────────────────────────────────
+  report (md):   ./lemmings/myapp.com/lemmings.2026.04.14.myapp.com.md
+  report (html): ./lemmings/myapp.com/lemmings.2026.04.14.myapp.com.html
+```
+
+### Final summary field reference
+
+| Field | Description |
+|---|---|
+| `total lemmings` | `terrain × pack`. The planned total — the number of lemmings that were supposed to run. |
+| `completed` | Lemmings that ran to completion and sent their LifeLog. In a healthy run this equals `total lemmings`. |
+| `failed` | Lemmings that encountered a fatal error before completing. A non-zero value warrants investigation. |
+| `total visits` | Sum of all page visits across all lemmings. One lemming makes many visits during its lifespan. |
+| `total bytes` | Total bytes transferred across all visits, including all polls made during waiting room waits. |
+| `2xx` / `3xx` / `4xx` / `5xx` | Response code counts by class. Each visit contributes exactly one count. |
+| `waiting room` | Number of visits that encountered a waiting room. See the [waiting room integration](/integrations/waiting-room) page for detail. |
+
+### Channel pressure
+
+If any result data was not collected cleanly, a channel pressure block appears before the separator:
+
+```
+  channel pressure:
+    overflow logs:  1,234
+    dropped logs:   56
+
+  ⚠  dropped logs indicate your -limit is too low
+     for the volume requested. increase -limit or
+     reduce -terrain and -pack for accurate results.
+```
+
+`overflow logs` are LifeLogs that were routed to the secondary overflow channel because the primary channel was full — these are still collected. `dropped logs` are LifeLogs that could not be placed in either channel and were discarded. A non-zero `dropped logs` value means the report is incomplete.
+
+<Warning>
+A report with non-zero `dropped logs` should not be used as a go/no-go decision for a traffic event. Re-run with a higher `-limit` or lower `-terrain` and `-pack` until `dropped logs` is zero.
+</Warning>
+
+---
+
+## Report files
+
+After the final summary, Lemmings delivers reports to every configured `-save-to` destination. Each destination receives two files:
+
+- `lemmings.YYYY.MM.DD.domain.md` — Markdown report
+- `lemmings.YYYY.MM.DD.domain.html` — Self-contained HTML report
+
+The HTML file embeds all styles inline and requires no external dependencies. It renders correctly when opened directly in a browser, hosted on S3, or sent as an email attachment.
+
+### Report sections
+
+Both the markdown and HTML reports contain the same sections:
+
+<AccordionGroup>
+  <Accordion title="Configuration">
+    Reproduces the run parameters: terrain, pack, total lemmings, until, ramp, and limit. This section lets you correlate results with specific test parameters when comparing multiple report files.
+  </Accordion>
+  <Accordion title="Summary">
+    Swarm-level aggregates: total visits, total bytes transferred, total lemmings held in the waiting room, and total errors.
+  </Accordion>
+  <Accordion title="Response codes">
+    Counts for each response code class: 2xx, 3xx, 4xx, 5xx.
+  </Accordion>
+  <Accordion title="Timing">
+    Global latency percentiles computed across all visits: fastest, p50, p90, p95, p99, and slowest. Percentiles use the nearest-rank method on a fully sorted duration slice.
+  </Accordion>
+  <Accordion title="Per-path breakdown">
+    One row per URL in the pool, sorted by hit count descending. Each row shows: hits, bytes, p50 latency, p99 latency, 2xx/3xx/4xx/5xx counts, waiting room count, and error count. This section is the primary tool for identifying which routes degraded first under load.
+  </Accordion>
+</AccordionGroup>
+
+### Checksum match rate
+
+Each visit records whether the response body matched the SHA-512 checksum computed at index time. A `Match: false` visit means the server returned different content than was indexed before the test started. A sustained increase in mismatches during a load test signals that your application is serving error pages or degraded content under pressure.

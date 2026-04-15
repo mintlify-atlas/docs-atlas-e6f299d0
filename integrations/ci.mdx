@@ -1,0 +1,114 @@
+---
+title: 'CI/CD Integration Patterns for Lemmings Load Testing'
+description: 'Run Lemmings in CI pipelines as a health check or pre-deploy gate, with clean log output, S3 report archiving, and pass/fail interpretation guidance.'
+---
+
+Lemmings works well as a CI health check, a pre-deploy gate, or a pre-launch load test. This page covers how to configure Lemmings for clean pipeline output, common patterns for different stages of your delivery process, and how to interpret results as a pass/fail signal.
+
+## CI mode: clean log output
+
+By default Lemmings uses carriage-return (`\r`) to overwrite the live ticker line in a TTY. CI environments do not have a real TTY, and this produces garbled output in log collectors. Disable it with `-tty=false`:
+
+```bash
+lemmings -hit https://staging.myapp.com \
+    -terrain 5 -pack 5 -until 10s \
+    -tty=false \
+    -save-to "s3://ci-reports/lemmings"
+```
+
+With `-tty=false`, each ticker update is written on its own line — suitable for any log aggregator, artifact store, or CI console.
+
+## Common CI patterns
+
+### Daily staging health check
+
+Run a small swarm against staging on every deploy or on a scheduled basis. A change in 2xx rate, checksum match rate, or p99 latency relative to a previous run is an early regression signal — caught before customers see it.
+
+```bash
+lemmings -hit https://staging.myapp.com \
+    -terrain 10 -pack 10 -until 15s \
+    -tty=false \
+    -save-to "s3://ci-reports/lemmings/$(date +%Y-%m-%d)"
+```
+
+<Tip>
+Date-stamp the S3 prefix so each run produces a distinct report. This lets you diff 2xx rates and p99 latencies across deploys over time.
+</Tip>
+
+### Pre-launch load test
+
+Run before a major traffic event — a product launch, a sale, a TV spot — with parameters that match your expected traffic shape. Include Prometheus metrics and report delivery to all stakeholders:
+
+```bash
+lemmings -hit https://staging.myapp.com \
+    -terrain 50 -pack 50 -until 30s \
+    -ramp 5m \
+    -tty=false \
+    -observe \
+    -save-to ".,s3://launch-reports/lemmings,mailto:team@mycompany.com?subject=Launch+Load+Test"
+```
+
+The `-ramp 5m` flag brings terrain groups online linearly over 5 minutes rather than all at once. This models how real traffic climbs from a broadcast event and lets you observe how your application behaves during the climb to peak load — which is often where failures first appear.
+
+### Infrastructure sizing
+
+Use Lemmings to find the capacity ceiling before you need it:
+
+<Steps>
+  <Step title="Start with a moderate load">
+    Run with a comfortable `-terrain` and `-pack` value and confirm 5xx count is zero.
+  </Step>
+  <Step title="Increase load incrementally">
+    Raise `-terrain` and `-pack` by 25–50% per run. Save each run to a dated S3 path for comparison.
+  </Step>
+  <Step title="Identify the ceiling">
+    The first run where 5xx responses appear marks your capacity ceiling.
+  </Step>
+  <Step title="Add infrastructure and verify">
+    Add capacity (scale out, increase instance size, tune connection pools), then re-run the ceiling configuration to confirm the ceiling moved.
+  </Step>
+</Steps>
+
+## Interpreting results as pass/fail
+
+Lemmings exits with code 0 on successful completion regardless of what the application returned. Use the metrics in the saved report files or Prometheus to determine pass/fail in your pipeline.
+
+<CardGroup cols={2}>
+  <Card title="dropped_logs = 0" icon="circle-check">
+    Result collection was complete. Every lemming's data is in the report. If this is non-zero, `-limit` is too low for the volume — reduce load or raise `-limit`.
+  </Card>
+  <Card title="2xx rate above threshold" icon="circle-check">
+    Your application is serving good responses under load. What threshold is acceptable depends on your SLA, but a drop from baseline is always a signal.
+  </Card>
+  <Card title="p99 latency below SLA" icon="circle-check">
+    The 99th percentile visit duration is within acceptable bounds. Available from the Markdown report's timing section, or from `lemmings_visit_duration_seconds` in Prometheus.
+  </Card>
+  <Card title="waiting_room count reasonable" icon="circle-check">
+    If you use the andreimerlescu/room package, the number of lemmings queued and their wait duration should be within the bounds you've planned for.
+  </Card>
+</CardGroup>
+
+### Scripting a pass/fail check
+
+Since Lemmings does not exit non-zero on high error rates, check the saved report in your pipeline script. For example, using the generated Markdown report to fail the build if 5xx count exceeds a threshold:
+
+```bash
+lemmings -hit https://staging.myapp.com \
+    -terrain 10 -pack 10 -until 15s \
+    -tty=false \
+    -save-to /tmp/lemmings-run
+
+REPORT=$(find /tmp/lemmings-run -name "*.md" | head -1)
+XX5=$(grep "| 5xx" "$REPORT" | awk -F'|' '{print $3}' | tr -d ' ')
+
+if [ "$XX5" -gt "10" ]; then
+  echo "FAIL: $XX5 5xx responses exceeded threshold of 10"
+  exit 1
+fi
+```
+
+Alternatively, scrape `lemmings_visits_total{status_class="5xx"}` from the Prometheus endpoint during the run and evaluate it as part of your observability pipeline.
+
+<Note>
+Lemmings exits as soon as all lemmings are dead and the report is written. The Prometheus endpoint is shut down at that point, so scrape the final metric values before the process exits, or read them from the saved report.
+</Note>

@@ -1,0 +1,213 @@
+---
+title: "Result collection: dual channels, counters, and percentiles"
+description: "How Lemmings collects LifeLogs without blocking goroutines — dual-channel drain, atomic counters, per-path stats, and nearest-rank percentiles."
+---
+
+Lemmings collects results from thousands of simultaneous goroutines without ever blocking one. This page explains the dual-channel `LifeLog` collection system, the atomic counters in `SwarmMetrics`, how `Reporter` accumulates per-path statistics, and how percentiles are computed from the raw duration data.
+
+## The core constraint: lemmings never block at death
+
+When a lemming dies, it sends its `LifeLog` to the swarm's collector. This send must never block — a blocked goroutine holds its semaphore slot, preventing the next lemming from starting and stalling the entire swarm.
+
+Lemmings solves this with a three-tier non-blocking drain implemented in `Swarm.sendLifeLog` in `swarm.go`:
+
+```go
+func (s *Swarm) sendLifeLog(ll LifeLog) {
+    select {
+    case s.primary <- ll:
+    default:
+        select {
+        case s.overflow <- ll:
+            s.metrics.OverflowLogs.Add(1)
+        default:
+            s.metrics.DroppedLogs.Add(1)
+        }
+    }
+}
+```
+
+The three tiers in order:
+
+1. **Primary channel** — the first destination. Sized to `min(terrain × pack, 500,000)`.
+2. **Overflow channel** — the second destination. Fixed capacity of 500,000.
+3. **Drop counter** — if both channels are full, `SwarmMetrics.DroppedLogs` is incremented and the `LifeLog` is discarded.
+
+<Warning>
+  A non-zero `dropped_logs` value in the final report means data was lost. This happens when `-limit` allows more goroutines to die simultaneously than the channels can absorb. Increase `-limit` (to slow the goroutine creation rate) or reduce `-terrain` and `-pack` (to reduce the total volume). Re-run until `dropped_logs` is zero before treating results as authoritative.
+</Warning>
+
+## Channel sizing
+
+```go
+// swarm.go
+const (
+    primaryChanCap  = 500_000
+    overflowChanCap = 500_000
+)
+
+// Primary channel: sized to actual total, capped at primaryChanCap
+primarySize := int(cfg.Terrain * cfg.Pack)
+if primarySize > primaryChanCap {
+    primarySize = primaryChanCap
+}
+```
+
+For most runs — up to 500,000 total lemmings — the primary channel is sized exactly to the total lemming count, meaning every `LifeLog` fits without overflow. Above 500,000 lemmings, the overflow channel absorbs the excess. Above 1,000,000, dropping begins.
+
+## How the collector drains the channels
+
+The `Swarm.collectResults` goroutine runs for the entire duration of the test. It drains both channels concurrently:
+
+```go
+func (s *Swarm) collectResults() {
+    for {
+        select {
+        case ll, ok := <-s.primary:
+            if !ok {
+                s.drainOverflow()
+                return
+            }
+            s.ingest(ll)
+        case ll := <-s.overflow:
+            s.ingest(ll)
+        }
+    }
+}
+```
+
+When all lemmings are dead, the swarm closes the primary channel. The collector detects the close (`ok == false`), drains whatever remains in the overflow channel, then exits. Only after the collector exits does the swarm proceed to render the report.
+
+## Atomic counters in SwarmMetrics
+
+Every live metric is tracked using `atomic.Int64` — no mutex, no lock contention under thousands of concurrent writers.
+
+```go
+type SwarmMetrics struct {
+    LemmingsAlive     atomic.Int64
+    LemmingsCompleted atomic.Int64
+    LemmingsFailed    atomic.Int64
+    TerrainsOnline    atomic.Int64
+    TotalVisits       atomic.Int64
+    TotalBytes        atomic.Int64
+    TotalWaitingRoom  atomic.Int64
+    Total2xx          atomic.Int64
+    Total3xx          atomic.Int64
+    Total4xx          atomic.Int64
+    Total5xx          atomic.Int64
+    OverflowLogs      atomic.Int64
+    DroppedLogs       atomic.Int64
+}
+```
+
+These counters are incremented by the collector's `ingest` method as each `LifeLog` arrives. They are also read every second by the STDOUT ticker and by the live dashboard. Because all reads and writes go through `atomic.Int64`, values are exact — not approximate estimates. The 2xx count in your report is the true count, verified correct under Go's race detector.
+
+<Info>
+  The `LemmingsAlive` counter is decremented (not incremented) when a `LifeLog` is ingested, because the lemming is already dead by the time its log arrives. It is incremented when the lemming first runs, inside `terrain.go`.
+</Info>
+
+## The LifeLog and Visit structures
+
+Every `LifeLog` carries the complete record of one lemming's life. The `Reporter.Ingest` method decomposes it into per-path statistics.
+
+```go
+type LifeLog struct {
+    Identity Identity   // ID, Terrain, Pack, BornAt
+    Terrain  int
+    Pack     int
+    Visits   []Visit
+    Error    error      // non-nil if lemming died abnormally
+    BornAt   time.Time
+    DiedAt   time.Time
+    Duration time.Duration
+}
+
+type Visit struct {
+    LemmingID   string
+    URL         string
+    StatusCode  int
+    BytesIn     int64
+    Duration    time.Duration  // wall clock from request start to body close
+    Checksum    string         // SHA-512 of actual response body
+    Expected    string         // SHA-512 from URLPool at index time
+    Match       bool           // Checksum == Expected
+    WaitingRoom WaitingRoomMetric
+    Timestamp   time.Time
+    Error       error
+}
+```
+
+Each `Visit` is an atomic unit of measurement: one page hit by one lemming. The `Duration` field is the wall-clock time from request start to body close — it is the value fed into percentile calculations.
+
+## Per-path statistics
+
+`Reporter` accumulates statistics per URL path in a `map[string]*pathStats` guarded by a mutex:
+
+| Field | Type | What it tracks |
+|---|---|---|
+| `Hits` | `int64` | Total requests to this URL |
+| `Bytes` | `int64` | Total bytes received |
+| `xx2/xx3/xx4/xx5` | `int64` | Response code class counts |
+| `durations` | `[]time.Duration` | All visit durations (for percentile calculation) |
+| `waitingRoom` | `int64` | Visits where a waiting room was detected |
+| `errors` | `int64` | Visits that returned a non-nil error |
+
+The `durations` slice grows unbounded during ingestion. Percentiles are computed from this slice when `Write` is called — after all lemmings are dead and no more `LifeLog`s are arriving.
+
+## Percentile calculation
+
+Percentiles are computed using the nearest-rank method on a fully sorted slice. The `percentile` function in `report.go`:
+
+```go
+func percentile(sorted []time.Duration, n int) time.Duration {
+    if len(sorted) == 0 {
+        return 0
+    }
+    // Nearest rank method
+    idx := int(math.Ceil(float64(n)/100.0*float64(len(sorted)))) - 1
+    if idx < 0 {
+        idx = 0
+    }
+    if idx >= len(sorted) {
+        idx = len(sorted) - 1
+    }
+    return sorted[idx]
+}
+```
+
+The caller is responsible for sorting before calling `percentile`. In `buildReportData`, the global duration slice is sorted once before computing P50, P90, P95, and P99. Per-path slices in `pathStats` are sorted individually before computing path-level P50 and P99.
+
+### What is computed
+
+| Scope | Percentiles |
+|---|---|
+| Global (all visits) | P50, P90, P95, P99, fastest, slowest |
+| Per-path | P50, P99 |
+
+<AccordionGroup>
+  <Accordion title="Why nearest-rank and not interpolation?">
+    The nearest-rank method returns an actual observed value from your dataset — a real duration recorded by a real lemming. Interpolated percentiles can produce values between two observations that no lemming ever actually experienced. For load testing, seeing real durations is more actionable: "p99 was 4.2 seconds" means a lemming actually waited 4.2 seconds, not that we estimated it did.
+  </Accordion>
+  <Accordion title="How to interpret dropped_logs in the report">
+    If `DroppedLogs` is non-zero in the final summary, the report's percentile and per-path statistics are incomplete — some lemmings' data was not collected. The remediation is to increase `-limit` so fewer goroutines are competing to send simultaneously, or to reduce `-terrain` and `-pack` so fewer lemmings die in the same instant. Re-run with `dropped_logs = 0` before drawing conclusions.
+  </Accordion>
+  <Accordion title="Why two channels instead of one large channel?">
+    A single channel sized to `terrain × pack` can be extremely large (up to several hundred thousand entries). Allocating the full size upfront wastes memory on small runs. The dual-channel design allocates a smaller primary channel for typical runs and reserves the overflow for large ones — memory grows to the actual need rather than the theoretical maximum.
+  </Accordion>
+</AccordionGroup>
+
+## The EventBus alongside collection
+
+Separate from the `LifeLog` collection pipeline, the `EventBus` provides a real-time event stream. When the collector calls `ingest`, it also calls `events.Emit(Event{Kind: EventLemmingDied, ...})`. Subscribers — including the dashboard and the Prometheus observer — receive this event synchronously on the collector goroutine.
+
+Subscribers must not block. The `EventBus` dispatches synchronously: a slow subscriber stalls the collector, which stalls ingestion of waiting `LifeLog`s.
+
+## Related concepts
+
+<CardGroup cols={2}>
+  <Card title="Three-tier concurrency model" icon="layer-group" href="/concepts/geographic-model">
+    Learn how Terrain, Pack, and Limit determine how many LifeLogs are produced.
+  </Card>
+  <Card title="URL discovery" icon="magnifying-glass" href="/concepts/url-discovery">
+    See how checksums are established at index time and compared per-visit in the LifeLog.
+  </Card>
+</CardGroup>

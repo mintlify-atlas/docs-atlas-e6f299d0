@@ -1,0 +1,120 @@
+---
+title: "Prometheus metrics setup and scraping for Lemmings"
+description: "Enable the Lemmings Prometheus exporter with -observe to expose 11 real-time metrics at /metrics. Configure URL label granularity to avoid high cardinality."
+---
+
+Lemmings exposes a Prometheus-compatible metrics endpoint when you pass the `-observe` flag. The endpoint is served at `http://localhost:9090/metrics` by default and is ready to scrape from the moment the swarm starts — all eleven metrics update in real time as lemmings are born, visit pages, enter waiting rooms, and die.
+
+## Enabling the exporter
+
+```bash
+lemmings -hit https://myapp.com -terrain 50 -pack 50 -until 30s \
+    -observe -metrics-port 9090 -metrics-url-label path
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-observe` | `false` | Enable the Prometheus metrics endpoint |
+| `-metrics-port` | `9090` | Port to serve `/metrics` on |
+| `-metrics-url-label` | `path` | URL label granularity: `full`, `path`, or `none` |
+
+The exporter starts before the first lemming is spawned and shuts down after the swarm completes. It uses an isolated `prometheus.Registry` — not the default global registry — so it does not conflict with other instrumented libraries in the same process.
+
+## Scrape configuration
+
+Add Lemmings as a scrape target in your `prometheus.yml`:
+
+```yaml prometheus.yml
+scrape_configs:
+  - job_name: "lemmings"
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
+No additional configuration is required. The endpoint serves standard Prometheus text exposition format.
+
+## Metrics reference
+
+All metrics are namespaced under the `lemmings_` prefix.
+
+| Metric | Type | Description |
+|---|---|---|
+| `lemmings_alive` | Gauge | Lemmings currently running |
+| `lemmings_completed_total` | Counter | Lemmings that completed their lifespan normally |
+| `lemmings_failed_total` | Counter | Lemmings that failed to start |
+| `lemmings_visits_total` | Counter | Page visits labeled by status class (`2xx`, `3xx`, `4xx`, `5xx`) |
+| `lemmings_visit_duration_seconds` | Histogram | Visit latency distribution (15 default buckets) |
+| `lemmings_bytes_total` | Counter | Total bytes transferred across all visits |
+| `lemmings_waiting_room_total` | Counter | Lemmings that hit a waiting room |
+| `lemmings_waiting_room_duration_seconds` | Histogram | Time spent in the queue before admission or expiry |
+| `lemmings_terrains_online` | Gauge | Terrain goroutine groups currently active |
+| `lemmings_dropped_logs_total` | Counter | LifeLogs dropped when both result channels were full |
+| `lemmings_overflow_logs_total` | Counter | LifeLogs routed to the overflow channel |
+
+## How events drive metrics
+
+Each Prometheus metric update is triggered by an event on the internal event bus. No polling — metrics update the instant the underlying action occurs.
+
+| Event | Metric update |
+|---|---|
+| `EventLemmingBorn` | `lemmings_alive` +1 |
+| `EventLemmingDied` | `lemmings_alive` −1, `lemmings_completed_total` +1 |
+| `EventLemmingFailed` | `lemmings_failed_total` +1 |
+| `EventVisitComplete` | `lemmings_visits_total` +1 (with `status_class` label), `lemmings_visit_duration_seconds` observation |
+| `EventWaitingRoom` | `lemmings_waiting_room_total` +1, `lemmings_waiting_room_duration_seconds` observation |
+| `EventTerrainOnline` | `lemmings_terrains_online` +1 |
+| `EventTerrainDone` | `lemmings_terrains_online` −1 |
+| `EventLogDropped` | `lemmings_dropped_logs_total` +1 |
+| `EventLogOverflow` | `lemmings_overflow_logs_total` +1 |
+
+## URL label granularity
+
+The `lemmings_visit_duration_seconds` histogram has a configurable `url` label controlled by `-metrics-url-label`. Choose a granularity that matches your URL surface area.
+
+<Tabs>
+  <Tab title="path (default)">
+    The path component of the URL is used as the label. Query strings and fragments are stripped. This is the right default for most applications.
+
+    ```bash
+    lemmings -hit https://myapp.com -terrain 50 -pack 50 -until 30s \
+        -observe -metrics-url-label path
+    ```
+
+    Label value examples: `/`, `/products`, `/checkout`, `/api/items`
+  </Tab>
+  <Tab title="full">
+    The full URL including scheme, host, path, and query string is used as the label. Useful when query parameters represent meaningfully different endpoints.
+
+    ```bash
+    lemmings -hit https://myapp.com -terrain 50 -pack 50 -until 30s \
+        -observe -metrics-url-label full
+    ```
+
+    Capped at 999 distinct values. URLs beyond the cap are recorded under the label value `"other"`.
+  </Tab>
+  <Tab title="none">
+    No `url` label. All visits collapse into a single histogram. Zero cardinality risk. Best for large sitemaps or any site with more than a few hundred distinct URLs.
+
+    ```bash
+    lemmings -hit https://myapp.com -terrain 50 -pack 50 -until 30s \
+        -observe -metrics-url-label none
+    ```
+  </Tab>
+</Tabs>
+
+## Cardinality warning
+
+<Warning>
+A histogram with 1,000+ URL labels at 15 buckets each creates 15,000+ active time series from a single label, which exceeds the comfortable range of a default Prometheus installation. Lemmings prevents this with a hard cap of 999 distinct URL label values. Once the cap is reached, additional URLs are recorded under the synthetic label value `"other"` and a warning is logged.
+
+If you are testing a site with more than 999 distinct pages, set `-metrics-url-label=none` to eliminate cardinality risk entirely.
+</Warning>
+
+## Interpreting channel pressure metrics
+
+`lemmings_dropped_logs_total` and `lemmings_overflow_logs_total` tell you whether result collection kept up with the load volume.
+
+- **`overflow_logs` > 0** — the primary result channel filled and some LifeLogs were routed to the overflow channel. Data was not lost, but your `-limit` value may be too low for comfortable headroom.
+- **`dropped_logs` > 0** — both channels were full and LifeLogs were discarded. Report data is incomplete. Reduce `-terrain` and `-pack`, increase `-limit`, or both.
+
+A clean run has both of these counters at zero for the full duration.

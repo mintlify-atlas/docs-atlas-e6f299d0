@@ -1,0 +1,213 @@
+---
+title: "Core flags: -hit, -terrain, -pack, -limit, -until, -ramp"
+description: "Reference for nine Lemmings core flags: -hit, -terrain, -pack, -limit, -until, -ramp, -crawl, -crawl-depth, and -tty. Default values, aliases, and examples."
+---
+
+Lemmings models real-user traffic through a three-tier concurrency hierarchy. The nine flags documented on this page control that hierarchy: the target URL, the number of terrain groups and lemmings per group, the semaphore ceiling, each lemming's lifespan, the ramp-up schedule, the URL-discovery crawl, and whether live output uses carriage-return overwriting or newlines for CI pipelines.
+
+---
+
+## Flags
+
+<ParamField path="-hit" type="string" default="http://localhost:8080/" required>
+  The origin URL for lemmings to traverse. Lemmings fetches the sitemap from
+  this origin at startup, builds a URL pool, and uses it as the base for all
+  lemming navigation during the run.
+
+  **Alias:** `-h`
+
+  **Validation:** must be non-empty and must start with `http` (both `http://` and `https://` are accepted).
+
+  **When to change:** set this to your staging or production URL. Always include the
+  trailing slash for root URLs, e.g. `https://myapp.com/`.
+</ParamField>
+
+<ParamField path="-terrain" type="int64" default="50">
+  The number of terrain goroutine groups. Each terrain group runs independently
+  and brings its own pack of lemmings online. Think of a terrain as a region or
+  state — a source of real-world traffic.
+
+  **Alias:** `-t`
+
+  **Validation:** must be between `1` and `10,000` (inclusive).
+
+  **When to increase:** when simulating traffic from many geographic regions or many
+  independent user cohorts simultaneously.
+
+  **When to decrease:** for lightweight CI checks or when your test machine has
+  limited CPU and goroutine headroom.
+</ParamField>
+
+<ParamField path="-pack" type="int64" default="50">
+  The number of lemmings per terrain group. Each lemming is an independent
+  goroutine with its own cookie jar, identity, and navigation behaviour. Total
+  lemmings launched equals `-terrain` × `-pack`.
+
+  **Alias:** `-p`
+
+  **Validation:** must be between `1` and `100,000` (inclusive).
+
+  **When to increase:** to raise the concurrent user density within each terrain,
+  simulating a denser population per region.
+
+  **When to decrease:** when your target cannot handle high per-region concurrency,
+  or to reduce goroutine pressure on the test machine.
+</ParamField>
+
+<Warning>
+  When `-terrain` × `-pack` exceeds 100,000, Lemmings prints a warning at startup.
+  Ensure both your test machine and the target application can handle the load
+  before proceeding with a run of that scale.
+</Warning>
+
+<ParamField path="-limit" type="int" default="100">
+  The semaphore ceiling — the maximum number of lemming goroutines that may be
+  running concurrently at any moment, regardless of how many terrain groups are
+  online. This is the system protection valve that prevents all lemmings from
+  spawning simultaneously on a machine that cannot support them.
+
+  **Alias:** `-l`
+
+  **Validation:** must be between `-1` and `1,000,000` (inclusive). `-1` disables
+  the semaphore entirely.
+
+  **When to increase:** when your machine has sufficient goroutine capacity and you
+  want more simultaneous lemmings active at peak concurrency.
+
+  **When to decrease:** when you observe high memory usage or CPU contention on the
+  test machine during a run.
+</ParamField>
+
+<Warning>
+  Setting `-limit=-1` disables the semaphore entirely. All `-terrain` × `-pack`
+  goroutines may spawn simultaneously. On large runs this can exhaust file
+  descriptors, memory, or CPU on the test machine. Use with caution and only when
+  you have verified your system can support the full goroutine count.
+</Warning>
+
+<ParamField path="-until" type="duration" default="30s">
+  How long each lemming lives. A lemming picks a URL from the pool, visits it,
+  dwells, picks another, and repeats until its `-until` deadline expires. Longer
+  lifespans produce more visits per lemming and more sustained load.
+
+  **Alias:** `-u`
+
+  **Validation:** must be greater than `0` and less than `24h`.
+
+  **When to increase:** to simulate longer user sessions or to accumulate more
+  per-path visit data in the report.
+
+  **When to decrease:** for quick smoke tests or CI health checks where a short
+  burst of load is sufficient.
+</ParamField>
+
+<ParamField path="-ramp" type="duration" default="5m">
+  The duration over which all terrain groups come online. Lemmings distributes
+  terrain group launches linearly across this window. A 5-minute ramp with 50
+  terrain groups means one new terrain group comes online every 6 seconds. Set
+  `-ramp` to model real traffic builds — such as the minutes after a TV spot airs —
+  rather than an instantaneous spike.
+
+  **Alias:** `-r`
+
+  **Validation:** must be greater than `0` and less than `24h`.
+
+  **When to increase:** to model slower, more gradual traffic growth and observe
+  how the application behaves during the climb to peak load.
+
+  **When to decrease:** to front-load all terrain groups quickly and observe
+  peak-load behaviour immediately.
+</ParamField>
+
+<ParamField path="-crawl" type="bool" default="false">
+  When enabled, Lemmings performs a depth-bounded crawl of the origin to discover
+  URLs when no sitemap is available. The crawl follows anchor links from the
+  origin page up to the depth specified by `-crawl-depth`, runs for a maximum of
+  5 minutes, and uses the discovered links to build the URL pool.
+
+  **Alias:** `-c`
+
+  **When to enable:** when your application does not serve a `sitemap.xml` or
+  provide a `Sitemap:` directive in `robots.txt`, and you want lemmings to
+  discover more than just the origin URL.
+
+  **When to leave disabled:** when your application serves a standard sitemap —
+  Lemmings will use it automatically without crawling.
+</ParamField>
+
+<ParamField path="-crawl-depth" type="int" default="3">
+  The maximum number of link hops Lemmings will follow from the origin when
+  crawling. Only takes effect when `-crawl` is enabled. A depth of `3` means
+  origin → link → link → link, after which crawling stops.
+
+  **Alias:** `-cd`
+
+  **Validation:** must be between `1` and `100` (inclusive).
+
+  **When to increase:** for large sites where important pages are buried several
+  levels deep in the link graph.
+
+  **When to decrease:** for sites with a shallow structure, or to limit crawl time
+  and URL pool size.
+</ParamField>
+
+<ParamField path="-tty" type="bool" default="true">
+  Controls how the live STDOUT ticker is rendered. When `true`, each tick
+  overwrites the previous line using a carriage return (`\r`), producing a
+  clean single-line display in a terminal. When `false`, each tick appends a
+  new line — suitable for CI pipelines and log aggregators that do not interpret
+  carriage returns.
+
+  **No alias** (set as `-tty=false` to disable).
+
+  **When to disable:** in any environment where carriage returns appear as
+  literal characters rather than cursor resets — CI systems (GitHub Actions,
+  GitLab CI, Jenkins), log forwarders, or when piping output to a file.
+</ParamField>
+
+---
+
+## Practical examples
+
+```bash
+# Basic test against a local server
+lemmings -hit http://localhost:8080/ -terrain 10 -pack 10 -until 30s
+
+# Pre-launch simulation: 50 regions × 100 users, 5-minute ramp
+lemmings -hit https://myapp.com -terrain 50 -pack 100 -until 30s -ramp 5m
+
+# With crawl for sites without a sitemap
+lemmings -hit https://myapp.com -terrain 10 -pack 10 -until 30s -crawl
+
+# CI mode: TTY disabled, short run
+lemmings -hit https://staging.myapp.com -terrain 5 -pack 5 -until 10s -tty=false
+
+# Infrastructure ceiling test: increase until first 5xx appear
+lemmings -hit https://myapp.com -terrain 100 -pack 100 -until 30s -limit 500
+```
+
+<Note>
+  The boot summary printed before any lemming moves shows the total lemming
+  count, estimated wall-clock duration (`-ramp` + `-until`), and all active
+  flags. Read it carefully before a large run to confirm the parameters match
+  your intent.
+</Note>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Report delivery" icon="file-export" href="/flags/report-delivery">
+    Configure where Lemmings writes its Markdown and HTML reports — local path,
+    S3, or email.
+  </Card>
+  <Card title="Live dashboard" icon="gauge" href="/flags/dashboard">
+    Unlock the real-time browser dashboard with the one-time authentication token
+    printed at startup.
+  </Card>
+  <Card title="Prometheus metrics" icon="chart-line" href="/flags/prometheus">
+    Enable the `/metrics` endpoint and tune URL label cardinality for your
+    Prometheus installation.
+  </Card>
+</CardGroup>

@@ -1,0 +1,293 @@
+---
+title: "Lemmings architecture: Swarm, Terrain, Pack, and LifeLog"
+description: "Learn how Lemmings coordinates thousands of stateful virtual users using a six-component architecture: Swarm, Terrain, Pack, Lemming, URLPool, and LifeLog."
+---
+
+Lemmings is built around six cooperating components. Understanding how they fit together tells you exactly what happens from the moment you run `lemmings -hit ...` to the moment the final report is written. This page walks through each component in the order it comes to life, with references to the real struct and field names from the source.
+
+## The Swarm
+
+The `Swarm` struct is the top-level coordinator. There is exactly one swarm per Lemmings invocation. It owns every other component and is responsible for:
+
+- Accepting a `SwarmConfig` from the CLI and propagating it to all layers
+- Constructing and indexing the `URLPool` before any lemmings move
+- Creating all `Terrain` groups and scheduling their ramp-up
+- Managing the dual-channel result collection system
+- Running the live dashboard and STDOUT ticker
+- Triggering the reporter when all lemmings are dead
+
+```go
+// Swarm is the top-level coordinator. One swarm per lemmings invocation.
+type Swarm struct {
+    cfg       SwarmConfig
+    ctx       context.Context
+    cancel    context.CancelFunc
+    pool      *URLPool
+    terrains  []*Terrain
+    primary   chan LifeLog
+    overflow  chan LifeLog
+    events    *EventBus
+    metrics   SwarmMetrics
+    reporter  *Reporter
+    dashboard *Dashboard
+    sema      sema.Semaphore
+    token     string
+    startedAt time.Time
+    mu        sync.Mutex
+    observers []Observer
+}
+```
+
+The `SwarmConfig` struct is the single source of truth flowing from the CLI into every layer. It holds all flag values: `Hit`, `Terrain`, `Pack`, `Limit`, `Until`, `Ramp`, `Crawl`, `CrawlDepth`, `SaveTo`, SMTP credentials, dashboard port, TTY mode, and Prometheus settings.
+
+## Terrain: goroutine groups
+
+A `Terrain` represents one goroutine group — the "state" in the geographic metaphor. Each terrain owns `cfg.Pack` lemmings and brings them all online when `Launch` is called by the ramp scheduler.
+
+```go
+// Terrain represents one goroutine group — the "state" in the geographic
+// metaphor. It owns cfg.Pack lemmings and brings them all online when
+// Launch is called.
+type Terrain struct {
+    id      int64
+    cfg     SwarmConfig
+    pool    *URLPool
+    send    func(LifeLog) // swarm's non-blocking sendLifeLog callback
+    bus     *EventBus
+    sem     sema.Semaphore
+    metrics *SwarmMetrics
+    wg      sync.WaitGroup
+    mu      sync.Mutex
+}
+```
+
+The `-terrain` flag controls how many `Terrain` instances the swarm creates. Each terrain is assigned a numeric ID used in logging and event emission.
+
+### The ramp
+
+Real traffic does not arrive all at once. When `-ramp` is set, the swarm calls `terrain.Launch(ctx)` on each terrain linearly over the ramp duration. For 50 terrain groups and a 5-minute ramp, one new group comes online every 6 seconds:
+
+```go
+interval := s.cfg.Ramp / time.Duration(n)
+```
+
+This lets you observe how your application behaves during the climb to peak load — which is often where failures first appear — not just at the peak itself.
+
+## Pack: lemmings per terrain
+
+The `-pack` flag sets how many lemmings each terrain spawns when `Launch` is called. `terrain.Launch` iterates from `0` to `cfg.Pack - 1` and starts a goroutine for each:
+
+```go
+func (t *Terrain) Launch(ctx context.Context) {
+    for i := int64(0); i < t.cfg.Pack; i++ {
+        t.wg.Add(1)
+        go t.spawnLemming(ctx, i)
+    }
+}
+```
+
+The total number of lemmings is therefore:
+
+```
+terrain × pack = total lemmings
+```
+
+For example, `-terrain 50 -pack 100` produces 5,000 lemmings.
+
+### The semaphore (Limit)
+
+Before spawning, each lemming goroutine calls `sem.Acquire(ctx)`. The semaphore is sized by the `-limit` flag (default: 100). This prevents all `terrain × pack` goroutines from blocking on network I/O simultaneously. Setting `-limit -1` disables the semaphore entirely — the swarm substitutes `terrain × pack` as the ceiling — which is dangerous on under-powered machines.
+
+## Lemming: the stateful navigating agent
+
+A `Lemming` is a stateful navigating HTTP agent with its own isolated session. It is constructed by `spawnLemming` inside a terrain goroutine:
+
+```go
+// Lemming is a stateful navigating HTTP agent with its own session and identity.
+type Lemming struct {
+    identity Identity
+    cfg      SwarmConfig
+    pool     *URLPool
+    client   *http.Client
+    bus      *EventBus
+    metrics  *SwarmMetrics
+    rng      *rand.Rand // per-lemming rng, no lock needed
+}
+```
+
+Each lemming receives its own `*http.Client` with an isolated `cookiejar.Jar` created by `terrain.spawnLemming`:
+
+```go
+jar, err := cookiejar.New(&cookiejar.Options{
+    PublicSuffixList: publicsuffix.List,
+})
+client := &http.Client{
+    Jar:     jar,
+    Timeout: t.cfg.Until,
+    ...
+}
+```
+
+Session cookies set for one lemming never leak into another. This is the behavior of real users, not the behavior of a shared HTTP client.
+
+### The navigation loop
+
+A lemming's entire life is the `Run` method. It derives a `context.WithTimeout` from `cfg.Until` and then loops:
+
+1. Pick a random URL from the `URLPool` using a per-lemming `*rand.Rand` (no lock needed)
+2. Make a GET request with a randomly selected browser User-Agent from `userAgents`
+3. Read the response body and compute its SHA-512 checksum
+4. Compare the checksum against the baseline stored in `URLPool.Checksums`
+5. Detect waiting room presence; if detected, poll every 3 seconds until admitted or deadline
+6. Emit a `Visit` event on the `EventBus`
+7. Append the `Visit` to the running `[]Visit` slice
+8. Check `ctx.Done()` — if expired, assemble and return the `LifeLog`
+
+```go
+func (l *Lemming) Run(parent context.Context) LifeLog {
+    ctx, cancel := context.WithTimeout(parent, l.cfg.Until)
+    defer cancel()
+    // ...navigation loop until ctx.Done()
+}
+```
+
+### User-Agent rotation
+
+Every individual HTTP request selects a User-Agent at random from a pool of five realistic browser strings covering Chrome on Windows, Safari on macOS, Firefox on Linux, Edge on Windows, and Chrome on macOS. The selection uses the per-lemming `rng` so no locking is required.
+
+## URLPool: the indexed navigation surface
+
+The `URLPool` is constructed once at boot, before any lemmings are created. All lemmings read from it concurrently — nothing writes after construction.
+
+```go
+// URLPool is the shared read-only navigation surface built once at boot.
+type URLPool struct {
+    Origin    string
+    URLs      []string
+    Checksums map[string]string // url -> SHA512 of body at index time
+}
+```
+
+`BuildURLPool` tries four strategies in order:
+
+1. **Sitemap at the standard path** — fetches `/sitemap.xml`, parses all `<loc>` entries including nested sitemap index files, fetches each URL to compute its SHA-512 baseline, and builds the pool.
+2. **Sitemap declared in robots.txt** — fetches `/robots.txt`, looks for a `Sitemap:` directive, and follows it.
+3. **Crawl** — if `-crawl` is enabled, performs a depth-bounded crawl from the origin following anchor links. The crawl runs for at most 5 minutes.
+4. **Origin only** — if no strategy yields results, uses the origin URL alone. The test still runs; it is just limited to one endpoint.
+
+Indexing runs with a concurrency of 5 (`indexConcurrency = 5`) to avoid load-testing the target during the indexing phase.
+
+<Note>
+  SHA-512 checksums are computed at index time and stored in `URLPool.Checksums`. Every lemming visit compares its response body checksum against this baseline. A sustained increase in `Match: false` visits during a run signals that your application is serving degraded content under load.
+</Note>
+
+## LifeLog: the complete record of a lemming's life
+
+When a lemming's context deadline expires, it assembles a `LifeLog` and returns it to the terrain goroutine, which calls `swarm.sendLifeLog`.
+
+```go
+// LifeLog is the complete record of a lemming's life.
+// It is constructed during Run() and sent to the swarm at death.
+type LifeLog struct {
+    Identity Identity
+    Terrain  int
+    Pack     int
+    Visits   []Visit
+    Error    error // non-nil if lemming died abnormally
+    BornAt   time.Time
+    DiedAt   time.Time
+    Duration time.Duration
+}
+```
+
+Each `Visit` in the `Visits` slice records one page hit:
+
+```go
+// Visit is the atomic unit of measurement — one page hit by one lemming.
+type Visit struct {
+    LemmingID   string
+    URL         string
+    StatusCode  int
+    BytesIn     int64
+    Duration    time.Duration // wall clock from request start to body close
+    Checksum    string        // SHA512 of actual response body
+    Expected    string        // SHA512 from URLPool at index time
+    Match       bool          // Checksum == Expected
+    WaitingRoom WaitingRoomMetric
+    CaptchaHit  bool
+    Error       error
+    Timestamp   time.Time
+}
+```
+
+## Dual-channel result collection
+
+The swarm collects `LifeLog` values through a non-blocking two-channel system. A lemming never blocks at death regardless of how much backpressure exists in the collector.
+
+```go
+const (
+    primaryChanCap  = 500_000
+    overflowChanCap = 500_000
+)
+```
+
+`sendLifeLog` tries the primary channel first, then overflow, then increments a drop counter:
+
+```go
+func (s *Swarm) sendLifeLog(ll LifeLog) {
+    select {
+    case s.primary <- ll:
+    default:
+        select {
+        case s.overflow <- ll:
+            s.metrics.OverflowLogs.Add(1)
+        default:
+            s.metrics.DroppedLogs.Add(1)
+        }
+    }
+}
+```
+
+If `DroppedLogs` is non-zero in the final summary, your `-limit` is too low for the volume requested. Increase `-limit` or reduce `-terrain` and `-pack` for accurate results. A correctly sized run always reports `dropped_logs: 0`.
+
+## EventBus and observers
+
+Every significant event — lemming born, lemming died, visit complete, waiting room entered, terrain online, log overflow, log dropped — is emitted on the `EventBus`. The bus fans out to two built-in observers:
+
+- **Dashboard** — the live HTTP dashboard at `http://localhost:4000`, which replays the last 1,000 events for late-joining browsers
+- **Prometheus observer** — active only when `-observe` is set; exposes 11 metrics under the `lemmings_` namespace at `/metrics`
+
+All atomic counters in `SwarmMetrics` — `LemmingsAlive`, `LemmingsCompleted`, `TotalVisits`, `Total2xx`, `Total3xx`, `Total4xx`, `Total5xx`, `TotalBytes`, `TotalWaitingRoom`, `OverflowLogs`, `DroppedLogs` — are updated by the `ingest` function as each `LifeLog` arrives.
+
+## Component lifecycle summary
+
+```text
+main()
+  └─ NewSwarm()
+       ├─ BuildURLPool()          // index URL surface before lemmings move
+       ├─ NewTerrain() × N        // construct terrain groups
+       └─ Run()
+            ├─ dashboard.Serve()  // start HTTP dashboard
+            ├─ collectResults()   // drain primary + overflow channels
+            ├─ tickSTDOUT()       // print live ticker every second
+            └─ ramp()
+                 └─ terrain.Launch() × N  // bring terrains online over ramp duration
+                      └─ spawnLemming() × Pack
+                           └─ lemming.Run()  // navigation loop until -until expires
+                                └─ sendLifeLog()  // non-blocking death drain
+```
+
+<CardGroup cols={2}>
+  <Card title="Geographic model" icon="globe" href="/concepts/geographic-model">
+    Deep dive into Terrain, Pack, and Limit — and how to size them for your traffic event.
+  </Card>
+  <Card title="URL discovery" icon="magnifying-glass" href="/concepts/url-discovery">
+    How Lemmings indexes your application's URL surface before the run starts.
+  </Card>
+  <Card title="Result collection" icon="database" href="/concepts/result-collection">
+    The dual-channel LifeLog system and what dropped_logs means for your results.
+  </Card>
+  <Card title="Command reference" icon="terminal" href="/flags/core">
+    Every flag that controls the components described on this page.
+  </Card>
+</CardGroup>

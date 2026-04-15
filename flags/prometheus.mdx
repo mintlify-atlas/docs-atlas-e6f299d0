@@ -1,0 +1,184 @@
+---
+title: "Prometheus flags: -observe, -metrics-port, -url-label"
+description: "Enable Lemmings Prometheus export with -observe to scrape 11 metrics at /metrics. Configure port and URL label granularity. Includes cardinality cap guidance."
+---
+
+Lemmings can export real-time metrics to a Prometheus-compatible scrape endpoint while a run is in progress. This page documents the three flags that control the metrics exporter — `-observe`, `-metrics-port`, and `-metrics-url-label` — along with the eleven metrics exposed under the `lemmings_` namespace and guidance for managing URL label cardinality.
+
+---
+
+## Flags
+
+<ParamField path="-observe" type="bool" default="false">
+  Enables the Prometheus metrics exporter. When set, Lemmings starts an HTTP
+  server on `-metrics-port` that serves a `/metrics` endpoint compatible with
+  any standard Prometheus installation. The endpoint is available for the full
+  duration of the run and shuts down cleanly when the run completes.
+
+  **Alias:** `-obs`
+
+  **When to enable:** whenever you want to scrape Lemmings metrics into Prometheus,
+  Grafana, or any compatible observability stack during a run.
+</ParamField>
+
+<ParamField path="-metrics-port" type="int" default="9090">
+  The TCP port on which the Prometheus `/metrics` endpoint listens. The endpoint
+  is available at `http://localhost:<port>/metrics`. Requests to the root path
+  (`/`) are redirected to `/metrics` automatically.
+
+  **Alias:** `-mp`
+
+  **Validation:** must be between `1024` and `65535` (inclusive).
+
+  **When to change:** if port `9090` conflicts with an existing Prometheus server
+  on the same machine, or when running multiple Lemmings instances simultaneously.
+</ParamField>
+
+<ParamField path="-metrics-url-label" type="string" default="path">
+  Controls the granularity of the `url` label on the `lemmings_visit_duration_seconds`
+  histogram. Accepts one of three values:
+
+  - **`path`** (default) — uses the URL path component only, stripping the scheme,
+    host, and query string. Balances per-route granularity with cardinality safety.
+  - **`full`** — uses the complete URL as the label value. Provides maximum
+    granularity but risks high cardinality on sites with many unique URLs.
+  - **`none`** — omits the `url` label entirely. All visits collapse into a single
+    histogram. Zero cardinality risk.
+
+  **Alias:** `-mul`
+
+  **Cardinality cap:** distinct `url` label values are capped at **999**. URLs
+  beyond this limit are recorded under the synthetic label value `"other"`. A
+  one-time warning is logged when the cap is reached.
+
+  **When to use `none`:** for sites with large URL surfaces (e.g., user-scoped
+  paths, UUIDs in URLs) where per-URL histograms would create thousands of time
+  series.
+</ParamField>
+
+<Note>
+  Lemmings uses an isolated Prometheus registry rather than the global default
+  registry. This avoids conflicts when running multiple Lemmings instances in
+  the same process, and prevents lemmings metrics from polluting the global
+  registry when Lemmings is used as a library.
+</Note>
+
+---
+
+## Metrics reference
+
+Lemmings exposes eleven metrics under the `lemmings_` namespace.
+
+### Lemming lifecycle
+
+| Metric | Type | Description |
+|---|---|---|
+| `lemmings_alive` | Gauge | Lemmings currently running. Incremented on birth, decremented on death. |
+| `lemmings_completed_total` | Counter | Lemmings that completed their lifespan normally. |
+| `lemmings_failed_total` | Counter | Lemmings that failed to start — typically because the semaphore could not be acquired before the context was cancelled. |
+
+### Visit metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `lemmings_visits_total` | Counter | `status_class` (`2xx`, `3xx`, `4xx`, `5xx`) | Page visits by HTTP status class. |
+| `lemmings_visit_duration_seconds` | Histogram | `url` (controlled by `-metrics-url-label`) | Visit latency distribution using Prometheus default buckets. |
+| `lemmings_bytes_total` | Counter | — | Total bytes transferred across all visits. |
+
+### Waiting room
+
+| Metric | Type | Description |
+|---|---|---|
+| `lemmings_waiting_room_total` | Counter | Lemmings that encountered a waiting room at least once during their lifespan. |
+| `lemmings_waiting_room_duration_seconds` | Histogram | Time spent in waiting rooms before admission or context expiry. Uses Prometheus default buckets. |
+
+### Terrain
+
+| Metric | Type | Description |
+|---|---|---|
+| `lemmings_terrains_online` | Gauge | Terrain goroutine groups currently active. Incremented as each group comes online during the ramp, decremented as each group finishes. |
+
+### Channel pressure
+
+| Metric | Type | Description |
+|---|---|---|
+| `lemmings_dropped_logs_total` | Counter | LifeLogs dropped because both the primary and overflow result channels were full. Non-zero values indicate `-limit` is too low for the requested volume. |
+| `lemmings_overflow_logs_total` | Counter | LifeLogs routed to the overflow channel because the primary channel was full. Non-zero values are a warning but do not indicate data loss. |
+
+---
+
+## URL label cardinality
+
+The `lemmings_visit_duration_seconds` histogram uses a `url` label that can
+become expensive if your application has a large URL surface. The cardinality
+cap of **999** distinct label values exists because a histogram with 1,000+
+URL labels at 15 buckets each creates 15,000+ active time series from one label
+alone — exceeding the comfortable range of a default Prometheus installation.
+
+<Tabs>
+  <Tab title="path (default)">
+    Uses the path component of the URL only. Query strings and fragments are
+    stripped. Best for most applications.
+
+    ```
+    /products/widget → /products/widget
+    /products/widget?ref=homepage → /products/widget
+    ```
+  </Tab>
+  <Tab title="full">
+    Uses the complete URL including scheme, host, and query string. Provides
+    maximum granularity. Use only when your site has fewer than 999 distinct
+    URLs.
+
+    ```
+    https://myapp.com/products/widget?ref=homepage → https://myapp.com/products/widget?ref=homepage
+    ```
+  </Tab>
+  <Tab title="none">
+    Omits the `url` label entirely. All visits collapse into a single histogram
+    with no URL breakdown. Zero cardinality risk. Recommended for large sitemaps
+    or when per-URL latency data is not required.
+  </Tab>
+</Tabs>
+
+<Warning>
+  When the 999-value cardinality cap is reached, Lemmings logs a warning and
+  records all additional URLs under the label value `"other"`. If you see this
+  warning, switch to `-metrics-url-label=path` or `-metrics-url-label=none` to
+  stay within safe cardinality limits.
+</Warning>
+
+---
+
+## Example
+
+```bash
+# Enable Prometheus export with default settings
+lemmings -hit https://myapp.com -terrain 50 -pack 50 -until 30s \
+    -observe -metrics-port 9090 -metrics-url-label path
+```
+
+Add a scrape job to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: lemmings
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Core flags" icon="sliders" href="/flags/core">
+    Control load shape, concurrency, lifespans, and ramp-up timing.
+  </Card>
+  <Card title="Live dashboard" icon="gauge" href="/flags/dashboard">
+    Monitor the same run in a browser with the built-in real-time dashboard.
+  </Card>
+  <Card title="Report delivery" icon="file-export" href="/flags/report-delivery">
+    Configure where the post-run Markdown and HTML reports are delivered.
+  </Card>
+</CardGroup>

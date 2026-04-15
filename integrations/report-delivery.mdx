@@ -1,0 +1,142 @@
+---
+title: 'Multi-Target Report Delivery: Local, S3, and Email'
+description: 'Lemmings renders Markdown and HTML reports after every run and delivers them concurrently to any combination of local paths, S3 buckets, and email recipients.'
+---
+
+When a Lemmings swarm completes, it renders two report formats — a Markdown file and a self-contained HTML file — and delivers both to every configured destination simultaneously. This page covers the three delivery targets: local filesystem, Amazon S3, and email via SMTP.
+
+## Configuring destinations
+
+Use the `-save-to` flag (alias `-s`) with a comma-separated list of destination URIs. The default destination is `.` (the current working directory).
+
+```bash
+lemmings -hit https://myapp.com \
+    -save-to ".,s3://my-bucket/lemmings,mailto:ops@mycompany.com?subject=Launch%20Test"
+```
+
+The `LEMMINGS_SAVE_TO` environment variable accepts the same comma-separated format and is merged with any `-save-to` flag value. Duplicates are removed before delivery begins.
+
+Each destination is parsed by its URI prefix and routed to the appropriate target. All targets run concurrently — a failure in one does not prevent others from receiving the report.
+
+## Output filename format
+
+Regardless of delivery target, the base filename follows this pattern:
+
+```
+lemmings.YYYY.MM.DD.<domain>
+```
+
+For a run against `https://myapp.com` on April 15, 2026, the files would be:
+
+```
+lemmings.2026.04.15.myapp.com.md
+lemmings.2026.04.15.myapp.com.html
+```
+
+If Lemmings runs more than once against the same target on the same day, the files are overwritten. Use a date-stamped `-save-to` path to preserve multiple runs per day.
+
+## Local delivery
+
+Local delivery is the default. Any path that does not start with `s3://` or `mailto:` is treated as a local filesystem path.
+
+```bash
+# All three forms are equivalent:
+-save-to .
+-save-to /var/reports
+-save-to file:///var/reports
+```
+
+Both files are written under a subdirectory tree:
+
+```
+<save-to>/lemmings/<domain>/lemmings.YYYY.MM.DD.<domain>.md
+<save-to>/lemmings/<domain>/lemmings.YYYY.MM.DD.<domain>.html
+```
+
+The directory tree is created automatically if it does not exist.
+
+## S3 delivery
+
+Prefix the destination with `s3://` to upload both files to an S3 bucket. Content-Type headers are set correctly so the files render when accessed via S3 URLs or CloudFront.
+
+```bash
+-save-to s3://my-bucket/lemmings/reports
+```
+
+### AWS credentials
+
+Credentials are read from the standard AWS credential chain in order:
+
+<Steps>
+  <Step title="Environment variables">
+    Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`.
+  </Step>
+  <Step title="Shared credentials file">
+    The file at `~/.aws/credentials` is checked if environment variables are not set.
+  </Step>
+  <Step title="IAM instance role">
+    On EC2, ECS, and Lambda, the instance role is used automatically. No credentials file or environment variables needed.
+  </Step>
+</Steps>
+
+Set the bucket region with `AWS_DEFAULT_REGION` or `AWS_REGION`. The bucket must already exist — Lemmings does not create buckets. The credentials must have `s3:PutObject` permission on the target prefix.
+
+## Email delivery
+
+Use a `mailto:` URI to send the report via SMTP. The HTML report is sent inline in the email body; the Markdown report is attached.
+
+```bash
+-save-to "mailto:ops@mycompany.com?subject=Lemmings%20Results&cc=team@mycompany.com"
+```
+
+The URI follows [RFC 6068](https://datatracker.ietf.org/doc/html/rfc6068) mailto syntax. Standard query parameters (`subject`, `cc`, `bcc`) are supported.
+
+### SMTP configuration
+
+Configure your SMTP server through environment variables or flags. Flags override environment variables when both are present.
+
+| Variable | Default | Flag |
+|---|---|---|
+| `LEMMINGS_SMTP_HOST` | `localhost` | `-smtp-host` |
+| `LEMMINGS_SMTP_PORT` | `587` | `-smtp-port` |
+| `LEMMINGS_SMTP_USER` | _(empty)_ | `-smtp-user` |
+| `LEMMINGS_SMTP_PASS` | _(empty)_ | `-smtp-pass` |
+| `LEMMINGS_SMTP_FROM` | `lemmings@localhost` | `-smtp-from` |
+
+TLS mode is auto-detected from the port:
+
+| Port | Mode |
+|---|---|
+| `465` | Implicit TLS |
+| `587` | STARTTLS (falls back to plain if server does not support it) |
+| `25` | Plain SMTP |
+
+Example using flags:
+
+```bash
+lemmings -hit https://myapp.com \
+    -save-to "mailto:ops@mycompany.com" \
+    -smtp-host mail.mycompany.com \
+    -smtp-port 587 \
+    -smtp-user sender@mycompany.com \
+    -smtp-from noreply@mycompany.com
+```
+
+## Multi-target example
+
+This command delivers the report to all three targets at once:
+
+```bash
+lemmings -hit https://myapp.com \
+    -save-to ".,s3://my-bucket/lemmings,mailto:ops@mycompany.com?subject=Launch%20Test"
+```
+
+All three deliveries start concurrently when the swarm finishes. If S3 upload fails (for example, due to a network error), the local file and email are still delivered successfully. Individual delivery failures are logged but do not cause Lemmings to exit with a non-zero status code.
+
+<Note>
+The report is rendered once and the same content is handed to every target. There is no per-target rendering step.
+</Note>
+
+<Warning>
+Avoid committing SMTP credentials in shell history or CI logs. Prefer environment variables (`LEMMINGS_SMTP_USER`, `LEMMINGS_SMTP_PASS`) over flags when credentials are involved.
+</Warning>
